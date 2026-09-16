@@ -980,6 +980,32 @@ static void io_writex(CPUArchState *env, CPUIOTLBEntry *iotlbentry,
     }
     r = memory_region_dispatch_write(mr, mr_offset, val, op, iotlbentry->attrs);
     if (r == MEMTX_DECODE_ERROR) {
+        /*
+         * QEMU40JZ-R2 diagnostic only.
+         *
+         * Identify the exact guest MMIO write that reaches the
+         * existing io_writex MEMTX_DECODE_ERROR assertion.
+         */
+        hwaddr q40jzr2_physaddr =
+            mr_offset +
+            section->offset_within_address_space -
+            section->offset_within_region;
+
+        fprintf(stderr,
+                "\n"
+                "============================================================\n"
+                "[QEMU40JZ-R2] IO_WRITEX MEMTX_DECODE_ERROR\n"
+                "phys=%08llx vaddr=%08llx mr_offset=%08llx\n"
+                "value=%016llx size=%u mmu_idx=%d retaddr=%p\n"
+                "============================================================\n",
+                (unsigned long long) q40jzr2_physaddr,
+                (unsigned long long) addr,
+                (unsigned long long) mr_offset,
+                (unsigned long long) val,
+                (unsigned) memop_size(op),
+                mmu_idx,
+                (void *) retaddr);
+
         cpu_dump_state(cpu, stderr, 0);
         assert(0);
     }

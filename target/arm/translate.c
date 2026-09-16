@@ -949,8 +949,14 @@ static void gen_aa32_ld_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
     tcg_temp_free(addr);
 }
 
-static void gen_aa32_st_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
-                            int index, MemOp opc)
+struct mem_log
+{
+    void (*read_cb)(hwaddr addr, uint64_t value, unsigned size, int is_write);
+    void (*write_cb)(hwaddr addr, uint64_t value, unsigned size, int is_write);
+} mem_log;
+
+static void gen_aa32_st_i32(DisasContext *s, TCGv_i32 val,
+                            TCGv_i32 a32, int index, MemOp opc)
 {
     TCGv addr;
 
@@ -961,17 +967,41 @@ static void gen_aa32_st_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
 
     addr = gen_aa32_addr(s, a32, opc);
     tcg_gen_qemu_st_i32(val, addr, index, opc);
+
+    /*
+     * QEMU40PCG:
+     * instrument the common AA32 store path.
+     * No custom TCG branches; address filtering is in the C helper.
+     */
+    /*
+     * QEMU40PCK:
+     * natural-runtime targeted fRefresh tracer.
+     * No runtime TCG branch and no global memory logger required.
+     */
+    if (mem_log.write_cb ||
+        s->pc_curr == 0xFE0A00E8U ||
+        s->pc_curr == 0xFE44D0FEU ||
+        s->pc_curr == 0xFE44D5C2U ||
+        s->pc_curr == 0xFE44DB68U ||
+        s->pc_curr == 0xFE44DC2AU ||
+        s->pc_curr == 0xFE44DC72U) {
+        TCGv_i32 opc_reg = tcg_temp_new_i32();
+        TCGv_i32 pc_reg = tcg_temp_new_i32();
+
+        tcg_gen_movi_i32(opc_reg, opc);
+        tcg_gen_movi_i32(pc_reg, s->pc_curr);
+
+        gen_helper_log_str(cpu_env, a32, val, opc_reg, pc_reg);
+
+        tcg_temp_free_i32(pc_reg);
+        tcg_temp_free_i32(opc_reg);
+    }
+
     tcg_temp_free(addr);
 }
 
 /* fixme: should be moved to memory.c and accessed somehow from there? */
 /* fixme: use MemoryRegionOps? The read callback doesn't accept address and value */
-struct mem_log
-{
-    void (*read_cb)(hwaddr addr, uint64_t value, unsigned size, int is_write);
-    void (*write_cb)(hwaddr addr, uint64_t value, unsigned size, int is_write);
-} mem_log;
-
 void memory_set_access_logging_cb(
     void (*mem_log_cb)(hwaddr addr, uint64_t value, unsigned size, int is_write),
     int access_mode)
@@ -1014,17 +1044,6 @@ static inline void gen_log_ldr(TCGv_i32 addr, TCGv_i32 val, int opc)
     }
 }
 
-static inline void gen_log_str(TCGv_i32 addr, TCGv_i32 val, int opc)
-{
-    /* called before the actual STR */
-    /* only compile the logging code if a CBR was registered */
-    if (mem_log.write_cb) {
-        TCGv_i32 opc_reg = tcg_temp_new_i32();
-        tcg_gen_movi_i32(opc_reg, opc);
-        gen_helper_log_str(addr, val, opc_reg);
-        tcg_temp_free_i32(opc_reg);
-    }
-}
 
 #define DO_GEN_LD(SUFF, OPC)                                             \
 static inline void gen_aa32_ld##SUFF(DisasContext *s, TCGv_i32 val,      \
@@ -1039,7 +1058,6 @@ static inline void gen_aa32_st##SUFF(DisasContext *s, TCGv_i32 val,      \
                                      TCGv_i32 a32, int index)            \
 {                                                                        \
     gen_aa32_st_i32(s, val, a32, index, OPC | s->be_data);               \
-    gen_log_str(a32, val, OPC);                                          \
 }
 
 static inline void gen_aa32_frob64(DisasContext *s, TCGv_i64 val)
@@ -1089,10 +1107,11 @@ static void gen_aa32_st_i64(DisasContext *s, TCGv_i64 val, TCGv_i32 a32,
 static inline void gen_aa32_st64(DisasContext *s, TCGv_i64 val,
                                  TCGv_i32 a32, int index)
 {
-    if (mem_log.write_cb) {
-        /* not implemented */
-        assert(0);
-    }
+    /*
+     * QEMU40PBX-R2:
+     * keep 64-bit stores completely uninstrumented.
+     * Isolate the PBX TEMP_VAL_DEAD failure.
+     */
     gen_aa32_st_i64(s, val, a32, index, MO_Q | s->be_data);
 }
 
@@ -11243,6 +11262,42 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
 
     dc->pc_curr = dc->base.pc_next;
+
+    /*
+     * QEMU40PDG:
+     * passive witness of the Canon 5D4 panel surface descriptor.
+     *
+     * FE1CC804 / 80C:
+     *   address + stride setup path
+     *
+     * FE1CC916 / 920:
+     *   active geometry setup path
+     *
+     * following PCs witness helper return values.
+     */
+    /*
+     * QEMU40PDK:
+     * FE4684B0 is DISP_SetUpdateOSDVram PDISPOSDINFO validator entry.
+     */
+    if (dc->pc_curr == 0xFE4684B0U ||
+        dc->pc_curr == 0xFE1CC804U ||
+        dc->pc_curr == 0xFE1CC808U ||
+        dc->pc_curr == 0xFE1CC80CU ||
+        dc->pc_curr == 0xFE1CC810U ||
+        dc->pc_curr == 0xFE1CC916U ||
+        dc->pc_curr == 0xFE1CC91AU ||
+        dc->pc_curr == 0xFE1CC920U ||
+        dc->pc_curr == 0xFE1CC924U ||
+        dc->pc_curr == 0xFE1CC84AU ||
+        dc->pc_curr == 0xFE1CC92AU ||
+        dc->pc_curr == 0xFE119236U) {
+        TCGv_i32 pc_reg = tcg_temp_new_i32();
+
+        tcg_gen_movi_i32(pc_reg, dc->pc_curr);
+        gen_helper_log_pcp(cpu_env, pc_reg);
+        tcg_temp_free_i32(pc_reg);
+    }
+
     insn = arm_lduw_code(env, dc->base.pc_next, dc->sctlr_b);
     is_16bit = thumb_insn_is_16bit(dc, dc->base.pc_next, insn);
     dc->base.pc_next += 2;

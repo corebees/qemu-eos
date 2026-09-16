@@ -1209,7 +1209,8 @@ unsigned int eos_handle_jpcore(unsigned int parm, unsigned int address, unsigned
                 //ret = 0x1010000;
 
                 if (strcmp(eos_state->model->name, "1300D") == 0
-                    || strcmp(eos_state->model->name, "A1100") == 0)
+                    || strcmp(eos_state->model->name, "A1100") == 0
+                    || strcmp(eos_state->model->name, "5D4") == 0)
                 {
                     /* 1300D, A1100 requires it (A1100 avoids HardwareDefect in ffcbb5bc)  */
                     ret = 0x1010000;

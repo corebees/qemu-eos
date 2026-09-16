@@ -525,6 +525,29 @@ struct eos_model_desc eos_model_list[] = {
         .name                   = MODEL_NAME_5D4,
         .digic_version          = 6,
         .ram_size               = 0x40000000,   /* 1GB */
+
+        /*
+         * QEMU40KE-ZICO-RAM — diagnostic 5D4-specific mapping.
+         *
+         * Canon FW 1.3.3 ZicoKick path copies 0x0010FEB0 bytes:
+         *
+         *   FEBAD0F0 -> 82000000
+         *
+         * requiring writable memory through 0x8210FEAF.
+         *
+         * DIGIC VI generic defaults currently provide only:
+         *
+         *   82100000-821FFFFF
+         *
+         * Override ram_extra[1] for 5D4 with one contiguous 2 MiB
+         * region covering both the missing first MiB and the
+         * previously inherited second MiB.
+         *
+         * Diagnostic only: physical identity/semantics of this
+         * region are not yet considered hardware-final.
+         */
+        .ram_extra_addr[1]      = 0x82000000,
+        .ram_extra_size[1]      = 0x00200000,
 //        .ram_manufacturer_id    = 0x18000401, // early 5D4 roms
         .ram_manufacturer_id    = 0x18000103,   /* RAM manufacturer: Micron */
         .card_led_address       = 0xD20B0224,

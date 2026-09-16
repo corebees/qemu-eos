@@ -448,9 +448,17 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
     if (tb_exec_cb) {
         tb_exec_cb(cpu, tb);
     }
-    /* See if we can patch the calling TB. */
+    /* QEMU40PET — targeted no-chain for 5D4 OLC tracing only */
     if (last_tb) {
-        tb_add_jump(last_tb, tb_exit, tb);
+        uint32_t q40lo = (uint32_t)tb->pc & 0x00FFFFFFU;
+        bool q40_probe =
+            (q40lo >= 0x006E7000U && q40lo < 0x006E8200U) ||
+            (q40lo >= 0x0067A000U && q40lo < 0x0067B100U) ||
+            (q40lo >= 0x00674800U && q40lo < 0x00675300U);
+
+        if (!q40_probe) {
+            tb_add_jump(last_tb, tb_exit, tb);
+        }
     }
     return tb;
 }

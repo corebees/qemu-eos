@@ -18,6 +18,10 @@
 #define MPU_DPRINTF0(fmt, ...) DPRINTF("",      EOS_LOG_MPU, fmt, ## __VA_ARGS__)
 #define MPU_EPRINTF0(fmt, ...) EPRINTF("",      EOS_LOG_MPU, fmt, ## __VA_ARGS__)
 
+/* QEMU40PAD_BC_R20GW */
+extern volatile unsigned int qemu40_sio3_next_source;
+
+
 // Forward declare static functions
 static void mpu_send_next_spell(void);
 static void mpu_enqueue_spell(int spell_set, int out_spell, uint16_t *copied_spell);
@@ -37,6 +41,7 @@ static int mpu_init_spell_count = 0;
 
 #include "mpu_spells/5D2.h"
 #include "mpu_spells/5D3.h"
+#include "mpu_spells/5D4.h"
 #include "mpu_spells/6D.h"
 #include "mpu_spells/50D.h"
 #include "mpu_spells/60D.h"
@@ -100,6 +105,7 @@ static void mpu_send_next_spell(void)
 
         /* request a SIO3 interrupt */
         /* use 100 here if brute-forcing MPU spells, to avoid overflowing Canon buffers */
+        qemu40_sio3_next_source = 1; /* R20GY SEND_NEXT */
         eos_trigger_int(eos_state->model->mpu_sio3_interrupt, 0);
     }
     else
@@ -310,6 +316,7 @@ void mpu_handle_sio3_interrupt(void)
                 
                 if (eos_state->mpu.out_char + 2 < num_chars)
                 {
+                    qemu40_sio3_next_source = 2; /* R20GY SEND_CHAIN */
                     eos_trigger_int(eos_state->model->mpu_sio3_interrupt, 0);   /* SIO3 */
                 }
                 else
@@ -340,6 +347,7 @@ void mpu_handle_sio3_interrupt(void)
         {
             /* more data to receive */
             MPU_DPRINTF("Request more data\n");
+            qemu40_sio3_next_source = 3; /* R20GY RECEIVE_CHAIN */
             eos_trigger_int(eos_state->model->mpu_sio3_interrupt, 0);   /* SIO3 */
         }
     }
@@ -364,6 +372,7 @@ void mpu_handle_mreq_interrupt(void)
             /* it appears to be harmless,  but I'm not sure what happens with more than 1 message queued */
             MPU_DPRINTF("next message was started in SIO3\n");
         }
+        qemu40_sio3_next_source = 4; /* R20GY MREQ_RECEIVE */
         eos_trigger_int(eos_state->model->mpu_sio3_interrupt, 0);   /* SIO3 */
     }
 }
@@ -1217,6 +1226,7 @@ void mpu_spells_init(void)
 
     MPU_SPELL_SET(5D2)
     MPU_SPELL_SET(5D3)
+    MPU_SPELL_SET(5D4)
     MPU_SPELL_SET(6D)
     MPU_SPELL_SET(50D)
     MPU_SPELL_SET(60D)

@@ -84,7 +84,9 @@ DEF_HELPER_3(set_cp_reg64, void, env, ptr, i64)
 DEF_HELPER_2(get_cp_reg64, i64, env, ptr)
 
 DEF_HELPER_3(log_ldr, void, i32, i32, i32)
-DEF_HELPER_3(log_str, void, i32, i32, i32)
+DEF_HELPER_5(log_str, void, env, i32, i32, i32, i32)
+DEF_HELPER_5(log_str64, void, env, i32, i64, i32, i32)
+DEF_HELPER_2(log_pcp, void, env, i32)
 
 DEF_HELPER_2(get_r13_banked, i32, env, i32)
 DEF_HELPER_3(set_r13_banked, void, env, i32, i32)

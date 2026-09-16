@@ -32,6 +32,36 @@
 #define IGNORE_CONNECT_POLL
 
 #define DIGIC_TIMER_STEP 0x100
+
+/* QEMU40PAD_BC_R20GW */
+volatile unsigned int qemu40_sio3_next_source = 0;
+volatile unsigned int qemu40_sio3_pending_source = 0;
+volatile unsigned int qemu40_sio3_active_source = 0;
+
+/* QEMU40PAD_BC_R20GX */
+volatile unsigned int qemu40_sio3_ring_head = 0;
+volatile unsigned int qemu40_sio3_ring_seq[32];
+volatile unsigned int qemu40_sio3_ring_kind[32];
+volatile unsigned int qemu40_sio3_ring_src[32];
+volatile unsigned int qemu40_sio3_ring_irqid[32];
+volatile unsigned int qemu40_sio3_ring_sched[32];
+
+static void qemu40_sio3_record(
+    unsigned int kind,
+    unsigned int src,
+    unsigned int irqid,
+    unsigned int sched)
+{
+    unsigned int n = qemu40_sio3_ring_head++;
+    unsigned int i = n & 31;
+
+    qemu40_sio3_ring_seq[i] = n;
+    qemu40_sio3_ring_kind[i] = kind;
+    qemu40_sio3_ring_src[i] = src;
+    qemu40_sio3_ring_irqid[i] = irqid;
+    qemu40_sio3_ring_sched[i] = sched;
+}
+
 #define DIGIC_TIMER20_MASK (0x000FFFFF & ~(DIGIC_TIMER_STEP-1))
 #define DIGIC_TIMER32_MASK (0xFFFFFFFF & ~(DIGIC_TIMER_STEP-1))
 
@@ -652,6 +682,20 @@ EOSRegionHandler eos_handlers[] =
     { "JP62",         0xC0E10000, 0xC0E1FFFF, eos_handle_jpcore, 1 },
     { "JP57",         0xC0E20000, 0xC0E2FFFF, eos_handle_jpcore, 2 },
 
+    /*
+     * QEMU40EA diagnostic: 5D4 FW 1.3.3 JpCore bases.
+     * Runtime table at 0x105FC:
+     *   core0 D0100000
+     *   core1 D0110000
+     *   core2 D0120000
+     *
+     * Route these blocks to the existing JpCore emulator instead of
+     * the generic DIGIC6 catch-all.
+     */
+    { "JP5D4-0",      0xD0100000, 0xD010FFFF, eos_handle_jpcore, 0 },
+    { "JP5D4-1",      0xD0110000, 0xD011FFFF, eos_handle_jpcore, 1 },
+    { "JP5D4-2",      0xD0120000, 0xD012FFFF, eos_handle_jpcore, 2 },
+
     { "EEKO",         0xD02C2000, 0xD02C243F, eos_handle_eeko_comm, 0 },
 
     // generic catch-all for everything unhandled from this range
@@ -668,6 +712,8 @@ EOSRegionHandler eos_handlers[] =
   //{ "XDMAC8",       0xC9200D40, 0xC9200D7F, eos_handle_xdmac8, 1 },
   //{ "XDMAC8",       0xC9200D80, 0xC9200DBF, eos_handle_xdmac8, 2 },
 
+    /* 5D4 uses MEMDIV from 0xD9000A20; preserve legacy range below. */
+    { "MEMDIV",       0xD9000A20, 0xD90015FF, eos_handle_memdiv, 0 },
     { "MEMDIV",       0xD9001600, 0xD900FFFF, eos_handle_memdiv, 0 },
 
     { "ROMID",        0xBFE01FD0, 0xBFE01FDF, eos_handle_rom_id, 0 },
@@ -998,6 +1044,19 @@ static void eos_interrupt_timer_body(void)
                         eos_state->irq_schedule[pos] = 0;
                     }
 
+                    if (pos == 0x147)
+                    {
+                        qemu40_sio3_active_source =
+                            qemu40_sio3_pending_source;
+                        qemu40_sio3_pending_source = 0;
+
+                        qemu40_sio3_record(
+                            3,
+                            qemu40_sio3_active_source,
+                            eos_state->irq_id,
+                            eos_state->irq_schedule[pos]);
+                    }
+
                     eos_state->irq_id = pos;
                     eos_state->irq_enabled[eos_state->irq_id] = 0;
 
@@ -1211,6 +1270,35 @@ static void draw_line8_32(void *opaque,
         s ++;
         d += 4;
     } while (-- width != 0);
+}
+
+/*
+ * QEMU40PDK-5D4-3BPP
+ *
+ * First narrow scanout candidate for the natural 5D4 panel plane.
+ *
+ * The observed XIMR source is packed by QEMU40PDH into three bytes
+ * per pixel in little-endian B,G,R byte order.
+ *
+ * This is deliberately model-specific evidence-driven rendering,
+ * not a generic interpretation of Canon format 0x11060200.
+ */
+static void draw_line_5d4_3bpp_32(void *opaque,
+                uint8_t *d, const uint8_t *s, int width, int deststep)
+{
+    (void) opaque;
+    (void) deststep;
+
+    do {
+        uint8_t b = s[0];
+        uint8_t g = s[1];
+        uint8_t r = s[2];
+
+        ((uint32_t *) d)[0] = rgb_to_pixel32(r, g, b);
+
+        s += 3;
+        d += 4;
+    } while (--width != 0);
 }
 
 static uint8_t clip_yuv(int v) {
@@ -1579,6 +1667,49 @@ static void eos_update_display(void *parm)
             s->disp.bmp_pitch, yuv_width*2, linesize, 0, s->disp.invalidate,
             draw_line8_32_bmp_yuv, s,
             &first, &last
+        );
+    }
+    else if (strcmp(s->model->name, MODEL_NAME_5D4) == 0 &&
+             s->disp.bmp_vram &&
+             s->disp.bmp_pitch >= width * 3)
+    {
+        /*
+         * QEMU40PDK-5D4-3BPP
+         *
+         * width/height come from D2018200 via the PDB routing fix.
+         * bmp_vram comes from D20182E8.
+         * bmp_pitch comes from D20182EC.
+         *
+         * For the natural startup case:
+         *   width      = 900
+         *   height     = 600
+         *   bmp_pitch  = 2880 = 960 * 3
+         *
+         * framebuffer_update_display will advance each source row by
+         * 2880 bytes while draw_line_5d4_3bpp_32 consumes 900 pixels.
+         */
+        uint64_t size =
+            (uint64_t) height * s->disp.bmp_pitch;
+
+        MemoryRegionSection section = memory_region_find(
+            s->system_mem,
+            s->disp.bmp_vram,
+            size
+        );
+
+        framebuffer_update_display(
+            surface,
+            &section,
+            width,
+            height,
+            s->disp.bmp_pitch,
+            linesize,
+            0,
+            1,
+            draw_line_5d4_3bpp_32,
+            s,
+            &first,
+            &last
         );
     }
     else if (strcmp(s->model->name, MODEL_NAME_EOSM3) == 0 ||
@@ -2394,6 +2525,1846 @@ EOSRegionHandler *eos_find_handler(unsigned int address)
 
 unsigned int eos_handler(unsigned int address, unsigned char type, unsigned int value)
 {
+    /*
+     * QEMU40MR — 5D4 I2C1 / CH2 runtime trace.
+     *
+     * Static ROM audit proves:
+     *   D6040000 = I2C controller 0
+     *   D6050000 = I2C controller 1 / Canon CH2
+     *   IRQ 0x10D = I2C1_TIRQ
+     *   IRQ 0x12D = I2C1_SIRQ
+     *
+     * TRACE ONLY:
+     * no MMIO values changed;
+     * no IRQ generated;
+     * no return values modified.
+     */
+    /*
+     * QEMU40NR:
+     * QEMU40MR full-range CH2 MMIO tracing retired.
+     * It was diagnostic-only and produced excessive log volume.
+     */
+
+    /*
+     * QEMU40MS — 5D4 I2C1 TCMP causal probe.
+     *
+     * QEMU40MR proved:
+     *
+     *   D6050000 <- 0x30000D80
+     *   "write start condition"
+     *   D6050000 <- 0x30008C80
+     *   ... TCMP timeout ...
+     *
+     * QEMU40MQ proved:
+     *   controller = I2C1 / Canon CH2
+     *   TIRQ       = IRQ 0x10D
+     *   TIRQ ISR   = FE14DA44
+     *
+     * Diagnostic only.
+     *
+     * On the exact final start write:
+     *   - arm one synthetic TCMP state
+     *   - assert I2C1_TIRQ
+     *
+     * On the TIRQ callback's next D6050000 read:
+     *   - return the candidate completed status 0x03108000
+     *   - deassert IRQ 0x10D
+     *
+     * No I2C slave/device response is emulated here.
+     */
+    static unsigned int q40ms_tcmp_armed = 0;
+    static unsigned int q40ms_tcmp_count = 0;
+    static unsigned int q40ms_status_reads = 0;
+    static unsigned int q40mu_ack_count = 0;
+    static unsigned int q40mw_post_tirq = 0;
+    static unsigned int q40mw_post_reads = 0;
+
+    /*
+     * QEMU40NB:
+     *
+     * Canon uses a runtime expected-status table.
+     *
+     * QEMU40NA proved for CH2:
+     *
+     *   30008C80 -> expected 03108000
+     *   3000F480 -> expected 03048000
+     */
+    static unsigned int q40nb_tcmp_status = 0;
+    static unsigned int q40nb_tcmp_write = 0;
+    static unsigned int q40nb_tcmp_read = 0;
+
+    /*
+     * QEMU40NC — I2C1 RX-count causal probe.
+     *
+     * FE14DFC6 reads D6050010.
+     * FE14DFC8 extracts bits 31:24 as received byte count.
+     * FE14DFCA compares this count against the requested size.
+     *
+     * Current Audio/Pana reads are one-byte transactions.
+     */
+    static unsigned int q40nc_rx_ready = 0;
+    static unsigned int q40nc_rxcount_reads = 0;
+    static unsigned int q40nc_rxdata_reads = 0;
+
+    /*
+     * QEMU40OU-R2 — CH2 transfer-descriptor probe.
+     *
+     * Diagnostic only.  No controller semantics are changed.
+     *
+     * Record writes performed after 30008C80 and report them
+     * when Canon arms the receive phase with 3000F480.
+     */
+    static unsigned int q40ou_read_arms = 0;
+    static unsigned int q40ou_data_writes = 0;
+    static unsigned int q40ou_data0 = 0;
+    static unsigned int q40ou_data1 = 0;
+    static unsigned int q40ou_data2 = 0;
+    static unsigned int q40ou_data3 = 0;
+    static unsigned int q40ou_aux_writes = 0;
+    static unsigned int q40ou_aux_last = 0;
+
+    /*
+     * QEMU40PAD-AD:
+     *
+     * Causal EDID payload witness using the natural CH2
+     * receive path.
+     *
+     * PAD-AB proved Canon naturally performs:
+     *
+     *   slave 0x7C, offset 0x00, 64 bytes
+     *   slave 0x7C, offset 0x40, 64 bytes
+     *
+     * and the generic QEMU40OV controller completes both
+     * reads while returning zero for every byte.
+     *
+     * Capture the first DATA byte of the RX descriptor so a
+     * long read can still be identified after the rolling
+     * q40ou_data0..3 window has discarded the slave address.
+     *
+     * This remains a synthetic diagnostic EDID, NOT a model
+     * of a real display or Panasonic device.
+     */
+    static unsigned int q40ad_first_data = 0;
+    static unsigned int q40ad_active_edid = 0;
+    static unsigned int q40ad_edid_read_arms = 0;
+    static unsigned int q40ad_edid_bytes = 0;
+
+    /*
+     * QEMU40OV — generic CH2 multi-byte RX state.
+     *
+     * QEMU40OU-R2 proved that Canon programs one 0x10 DATA
+     * write for each requested RX byte, after the slave/read
+     * address byte.
+     *
+     * Therefore:
+     *
+     *     requested_rx = data_writes - 1
+     *
+     * This is derived from controller programming and is not
+     * Panasonic-specific.
+     */
+    static unsigned int q40ov_rx_total = 0;
+    static unsigned int q40ov_rx_remaining = 0;
+
+    /*
+     * QEMU40OZ-A — Panasonic register/status witness.
+     *
+     * Preserve the register byte written before the repeated
+     * START, then correlate it with the Panasonic read address
+     * 0x71 at RX arm.
+     */
+    static unsigned int q40oz_prev_reg = 0;
+    static unsigned int q40oz_active_reg = 0;
+    static unsigned int q40oz_active_panasonic = 0;
+    static unsigned int q40oz_panasonic_08_reads = 0;
+    static unsigned int q40oz_status_witness_done = 0;
+
+/*
+ * QEMU40PAD-G:
+ * observe the first eight Panasonic reg0x90 polls.
+ * Diagnostic only; no guest-visible data modification.
+ */
+static unsigned int q40padg_reg90_snapshots = 0;
+
+/*
+ * QEMU40PAD-Q:
+ * bounded read-only timeline of Panasonic RX transactions.
+ *
+ * Goal:
+ * correlate RESET_SM, lower dispatcher and upper EDID state
+ * at the first byte of each Panasonic receive transaction.
+ *
+ * No guest-visible data is modified.
+ */
+static unsigned int q40padp_timeline_count = 0;
+
+/*
+ * QEMU40PAD-R:
+ *
+ * Causal Panasonic EDID-preread experiment.
+ *
+ * Previous RE established:
+ *
+ *   lower dispatcher state +16 == 2
+ *       -> FE1CF756 waits for the next useful event
+ *
+ *   upper FE211672 state +44 == 1
+ *       -> Pana_Init EDID-preread machine is armed
+ *
+ * Old reg90=0x03 experiments were not synchronized to
+ * these states.
+ *
+ * PAD-R therefore supplies 0x03 only inside the proven
+ * lower=2 / upper=1 window, at most twice.
+ */
+static unsigned int q40padr_status_injections = 0;
+
+/*
+ * QEMU40PAD-S:
+ * bounded observational microtrace for the proven
+ * lower=2 / upper=1 Panasonic preread window.
+ */
+static unsigned int q40pads_micro_count = 0;
+
+    /*
+     * QEMU40ND — I2C1 STOP pre-gate causal probe.
+     *
+     * After RX data has been consumed, FE14DC42 checks
+     * D6050000 bits 15 and 8 before issuing STOP.
+     *
+     * Keep the already-proven 0x02108100 status alive only
+     * across this narrow post-RX / pre-STOP window.
+     */
+    static unsigned int q40nd_stop_pregate = 0;
+    static unsigned int q40nd_stop_pregate_reads = 0;
+    static unsigned int q40nd_read_stop_arms = 0;
+
+    /*
+     * QEMU40NE — I2C1 SIRQ validator probe.
+     *
+     * Diagnostic only.
+     *
+     * ND proved the real CH2 read STOP command:
+     *
+     *     D6050000 <- 0x20001880
+     *
+     * SIRQ FE14DAE2 first requires status bit17.
+     * We preserve ND's known-good 0x02108100 status and
+     * add only bit17:
+     *
+     *     0x02108100 | 0x00020000 = 0x02128100
+     *
+     * FE14E2C0 will tell us the exact mask/expected pair.
+     */
+    static unsigned int q40ne_sirq_armed = 0;
+    static unsigned int q40ne_sirq_count = 0;
+    static unsigned int q40ne_status_reads = 0;
+    static unsigned int q40ne_ack_count = 0;
+
+    /*
+     * QEMU40NH — CH2 write-STOP SIRQ validator probe.
+     *
+     * Existing unresolved write STOP:
+     *
+     *     D6050000 <- 0x20000880
+     *
+     * Diagnostic status contains only bit17 so the Canon
+     * SIRQ callback enters FE14E2C0 and exposes its actual
+     * validator branch/expected value.
+     */
+    static unsigned int q40nh_sirq_armed = 0;
+    static unsigned int q40nh_write_stop_count = 0;
+    static unsigned int q40nh_status_reads = 0;
+    static unsigned int q40nh_ack_count = 0;
+
+    /*
+     * QEMU40NG — eos_trigger_int delay semantics.
+     *
+     * eos_trigger_int(id, delay) creates an interrupt.
+     * delay=0 does NOT deassert an interrupt.
+     *
+     * I2C TIRQ/SIRQ completions are therefore emitted once
+     * per controller completion and are not retriggered on ACK.
+     */
+
+    /*
+     * QEMU40NF — exact CH2 read-STOP SIRQ status.
+     *
+     * QEMU40NE runtime/GDB proved that CH2 takes validator A:
+     *
+     *     mask     = 0x0F5F8300
+     *     expected = 0x03420000
+     *
+     * Therefore the minimal exact latched SIRQ status is:
+     *
+     *     0x03420000
+     *
+     * It already contains bit17 required by FE14DB1A.
+     */
+
+    /*
+     * QEMU40MY — read-TCMP TIRQ expected-status probe.
+     */
+    static unsigned int q40my_read_tirq_armed = 0;
+    static unsigned int q40my_read_tirq_count = 0;
+
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        /*
+         * Exact transaction-start edge identified by QEMU40MR.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            (value == 0x30008C80U ||
+             value == 0x3000F480U))
+        {
+            /*
+             * QEMU40MW — post-TIRQ read-start status.
+             * New START begins a fresh controller phase.
+             */
+            q40mw_post_tirq = 0;
+
+            /*
+             * QEMU40NB — choose the status Canon's runtime
+             * expected table requires for this exact phase.
+             */
+            if (value == 0x30008C80U)
+            {
+                q40nb_tcmp_status = 0x03108000U;
+                q40nb_tcmp_write++;
+
+                if (q40nb_tcmp_write <= 10 ||
+                    (q40nb_tcmp_write % 1000U) == 0)
+                {
+                    fprintf(stderr,
+                            "[QEMU40NB-I2C1] WRITE-TCMP #%u "
+                            "status=03108000\n",
+                            q40nb_tcmp_write);
+                }
+            }
+            else
+            {
+                q40nb_tcmp_status = 0x03048000U;
+                q40nb_tcmp_read++;
+
+                if (q40nb_tcmp_read <= 10 ||
+                    (q40nb_tcmp_read % 1000U) == 0)
+                {
+                    fprintf(stderr,
+                            "[QEMU40NB-I2C1] READ-TCMP #%u "
+                            "status=03048000\n",
+                            q40nb_tcmp_read);
+                }
+            }
+
+            q40ms_tcmp_armed = 1;
+            q40ms_tcmp_count++;
+
+            if (q40ms_tcmp_count <= 10 ||
+                (q40ms_tcmp_count % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40MS-I2C1] START #%u "
+                        "D6050000=30008C80 -> IRQ 0x10D\n",
+                        q40ms_tcmp_count);
+            }
+
+            eos_trigger_int(0x10D, 1);
+        }
+
+        /*
+         * FE14DA44 TIRQ reads controller+0.
+         *
+         * Supply completion only while an exact transaction is armed.
+         */
+        /*
+         * QEMU40MU:
+         *
+         * TCMP is level/latched state.
+         *
+         * Do NOT consume it on the first controller read.
+         * Keep returning the completed status until Canon's
+         * TIRQ callback acknowledges the condition.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40ms_tcmp_armed)
+        {
+            q40ms_status_reads++;
+
+            if (q40ms_status_reads <= 10 ||
+                (q40ms_status_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40MU-I2C1] TCMP READ #%u "
+                        "-> 03108000 (latched)\\n",
+                        q40ms_status_reads);
+            }
+
+            return q40nb_tcmp_status;
+        }
+
+        /*
+         * FE14DAD0 acknowledges TIRQ by writing one of these
+         * two controller command values:
+         *
+         *     0x20009980
+         *     0x20008980
+         *
+         * Only here clear synthetic TCMP and deassert IRQ.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40ms_tcmp_armed &&
+            (value == 0x20009980U ||
+             value == 0x20008980U))
+        {
+            q40mu_ack_count++;
+
+            if (q40mu_ack_count <= 10 ||
+                (q40mu_ack_count % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40MU-I2C1] ACK #%u "
+                        "value=%08X -> clear TCMP state\\n",
+                        q40mu_ack_count,
+                        value);
+            }
+
+            q40ms_tcmp_armed = 0;
+
+            /*
+             * TIRQ completed successfully.
+             *
+             * MV-R2 proved the subsequent firmware status test sees:
+             *
+             *   0x02100100  -> bit15=0, bit8=1 -> FAIL
+             *
+             * Test the minimal transition:
+             *
+             *   0x02108100  -> bit15=1, bit8=1
+             */
+            /*
+             * 02108100 was proven only for the gate after
+             * the first/address TCMP.
+             *
+             * After read-TCMP, let subsequent controller
+             * accesses expose the next natural frontier.
+             */
+            q40mw_post_tirq =
+                (q40nb_tcmp_status == 0x03108000U);
+
+            q40nb_tcmp_status = 0;
+
+            /*
+             * QEMU40NG — eos_trigger_int delay semantics.
+             *
+             * The second argument is a delay, NOT an
+             * assert/deassert level. Calling:
+             *
+             *     eos_trigger_int(0x10D, 0)
+             *
+             * generated a second immediate TIRQ.
+             *
+             * Canon's ACK is represented by clearing the
+             * latched emulated controller state above.
+             */
+        }
+
+        #if 0
+        /* QEMU40MZ-R2 — QEMU40MY runtime disabled */
+        /*
+         * QEMU40MY — read-TCMP TIRQ expected-status probe.
+         *
+         * QEMU40MX proved that the second/read transfer is armed by:
+         *
+         *     D6050000 <- 0x3000F480
+         *
+         * immediately before Canon waits event bit 2.
+         *
+         * Diagnostic only:
+         * assert I2C1_TIRQ here, but DO NOT invent a new
+         * completion status. QEMU40MW will continue returning
+         * the already-observed post-TIRQ 0x02108100.
+         *
+         * The first status read deasserts the IRQ to avoid
+         * leaving the synthetic line asserted indefinitely.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x3000F480U)
+        {
+            q40my_read_tirq_armed = 1;
+            q40my_read_tirq_count++;
+
+            fprintf(stderr,
+                    "[QEMU40MY-I2C1] READ-TCMP ARM #%u "
+                    "pc=%08X value=3000F480 -> IRQ 0x10D\n",
+                    q40my_read_tirq_count,
+                    eos_state->cpu0->env.regs[15]);
+
+            eos_trigger_int(0x10D, 1);
+        }
+
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40my_read_tirq_armed)
+        {
+            q40my_read_tirq_armed = 0;
+
+            fprintf(stderr,
+                    "[QEMU40MY-I2C1] TIRQ STATUS READ "
+                    "-> deassert IRQ 0x10D\n");
+
+            eos_trigger_int(0x10D, 0);
+
+            /*
+             * Fall through intentionally.
+             *
+             * The QEMU40MW block below returns 0x02108100.
+             */
+        }
+
+        #endif
+
+        /*
+         * QEMU40MW — post-TIRQ read-start status.
+         *
+         * Do not invent any slave data and do not fire SIRQ.
+         *
+         * Only preserve the already-observed 0x02100100 status
+         * and set bit15, which FE14DC0C..FE14DC1E explicitly
+         * requires together with bit8.
+         */
+        /*
+         * QEMU40NI:
+         * A latched write-STOP SIRQ completion supersedes the
+         * earlier post-TIRQ controller-ready view.
+         *
+         * Preserve q40mw_post_tirq itself; merely stop it from
+         * shadowing the write-STOP diagnostic status.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            !q40ms_tcmp_armed &&
+            !q40nh_sirq_armed &&
+            q40mw_post_tirq)
+        {
+            q40mw_post_reads++;
+
+            if (q40mw_post_reads <= 10 ||
+                (q40mw_post_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40MW-I2C1] POST-TIRQ READ #%u "
+                        "-> 02108100\n",
+                        q40mw_post_reads);
+            }
+
+            return 0x02108100U;
+        }
+        /*
+         * QEMU40OU-R2 — CH2 transfer-descriptor probe.
+         *
+         * Diagnostic only:
+         *   - reset capture at address-phase START;
+         *   - remember the last four DATA writes;
+         *   - remember writes to AUX/COUNT;
+         *   - print the captured transaction at READ START.
+         *
+         * No MMIO return value or interrupt state is modified.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x30008C80U)
+        {
+            /*
+             * The write phase immediately preceding this
+             * repeated START ends with the device register.
+             */
+            q40oz_prev_reg = q40ou_data0 & 0xFFU;
+
+            q40ou_data_writes = 0;
+            q40ou_data0 = 0;
+            q40ou_data1 = 0;
+            q40ou_data2 = 0;
+            q40ou_data3 = 0;
+
+            /*
+             * QEMU40PAD-AD:
+             * new controller address phase.
+             */
+            q40ad_first_data = 0;
+            q40ad_active_edid = 0;
+
+            q40ou_aux_writes = 0;
+            q40ou_aux_last = 0;
+        }
+
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050004U)
+        {
+            /*
+             * QEMU40PAD-AD:
+             * save DATA #0 before the four-word rolling window
+             * discards it on long receive descriptors.
+             */
+            if (q40ou_data_writes == 0U)
+                q40ad_first_data = value & 0xFFU;
+
+            q40ou_data3 = q40ou_data2;
+            q40ou_data2 = q40ou_data1;
+            q40ou_data1 = q40ou_data0;
+            q40ou_data0 = value;
+            q40ou_data_writes++;
+        }
+
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050010U)
+        {
+            q40ou_aux_last = value;
+            q40ou_aux_writes++;
+        }
+
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x3000F480U)
+        {
+            q40ou_read_arms++;
+
+            q40oz_active_reg = q40oz_prev_reg;
+
+            /*
+             * QEMU40PAD-AD:
+             * natural EDID read fingerprint.
+             *
+             * PAD-AB:
+             *   slave       = 0x7C
+             *   chunk       = 64
+             *
+             * CH2 descriptor:
+             *   first DATA  = 0x7D (read address)
+             *   DATA #1..64 = receive slots
+             */
+            q40ad_active_edid =
+                (q40ou_data_writes == 65U &&
+                 (q40ad_first_data & 0xFFU) == 0x7DU &&
+                 (q40ou_data0 & 0xFFU) == 0x10U);
+
+            if (q40ad_active_edid)
+            {
+                q40ad_edid_read_arms++;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-AD] EDID READ ARM #%u "
+                        "slave=7C "
+                        "offset=%02X "
+                        "slots=%u "
+                        "first=%02X\n",
+                        q40ad_edid_read_arms,
+                        q40oz_active_reg & 0xFFU,
+                        q40ou_data_writes - 1U,
+                        q40ad_first_data & 0xFFU);
+            }
+
+            /*
+             * For a one-byte Panasonic receive OU-R2 proved:
+             *
+             *     data_writes = 2
+             *     data1       = 0x71
+             *     data0       = 0x10
+             */
+            q40oz_active_panasonic =
+                (q40ou_data_writes == 2U &&
+                 (q40ou_data1 & 0xFFU) == 0x71U &&
+                 (q40ou_data0 & 0xFFU) == 0x10U);
+
+            if (q40oz_active_panasonic &&
+                q40oz_active_reg == 0x08U)
+            {
+                q40oz_panasonic_08_reads++;
+
+                if (q40oz_panasonic_08_reads <= 4U)
+                {
+                    fprintf(stderr,
+                            "[QEMU40OZ-A-I2C1] PANASONIC REG08 "
+                            "read #%u\n",
+                            q40oz_panasonic_08_reads);
+                }
+            }
+
+            if (q40ou_read_arms <= 64 ||
+                (q40ou_read_arms % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40OU-I2C1] READ-ARM #%u "
+                        "pc=%08X "
+                        "data_writes=%u "
+                        "last=[%08X %08X %08X %08X] "
+                        "aux_writes=%u aux=%08X\n",
+                        q40ou_read_arms,
+                        eos_state->cpu0->env.regs[15],
+                        q40ou_data_writes,
+                        q40ou_data3,
+                        q40ou_data2,
+                        q40ou_data1,
+                        q40ou_data0,
+                        q40ou_aux_writes,
+                        q40ou_aux_last);
+            }
+        }
+
+        /*
+         * QEMU40NC — I2C1 RX-count causal probe.
+         *
+         * 30008C80 starts a new address phase.
+         * 3000F480 arms the actual read transfer.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U)
+        {
+            if (value == 0x30008C80U)
+            {
+                q40nc_rx_ready = 0;
+                q40ov_rx_total = 0;
+                q40ov_rx_remaining = 0;
+            }
+            else if (value == 0x3000F480U)
+            {
+                /*
+                 * QEMU40OV:
+                 *
+                 * OU-R2 runtime + FE14DCEA static audit:
+                 *
+                 *   DATA write #0 = slave/read address
+                 *   DATA write #1..N = N receive slots (0x10)
+                 *
+                 * Thus N = q40ou_data_writes - 1.
+                 */
+                if (q40ou_data_writes > 1U)
+                    q40ov_rx_total = q40ou_data_writes - 1U;
+                else
+                    q40ov_rx_total = 1U;
+
+                /*
+                 * Canon FE14DCEA caps a receive chunk at 126.
+                 * Keep the emulated state within that proven bound.
+                 */
+                if (q40ov_rx_total > 126U)
+                    q40ov_rx_total = 126U;
+
+                q40ov_rx_remaining = q40ov_rx_total;
+                q40nc_rx_ready = 1;
+
+                if (q40nb_tcmp_read <= 10 ||
+                    (q40nb_tcmp_read % 1000U) == 0)
+                {
+                    fprintf(stderr,
+                            "[QEMU40NC-I2C1] RX ARM #%u "
+                            "D6050000=3000F480\n",
+                            q40nb_tcmp_read);
+                }
+            }
+        }
+
+        /*
+         * FE14DFC6:
+         *
+         *   ldr  r0,[r4,#16]     ; D6050010
+         *   lsrs r3,r0,#24       ; RX byte count
+         *
+         * All reads currently blocking AudioCtrl/Pana are length 1.
+         * Supply only that controller count; no SIRQ is generated.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050010U &&
+            q40nc_rx_ready)
+        {
+            q40nc_rxcount_reads++;
+
+            if (q40nc_rxcount_reads <= 10 ||
+                (q40nc_rxcount_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40OV-I2C1] RXCOUNT #%u "
+                        "-> %02X000000 (count=%u) "
+                        "remaining=%u\n",
+                        q40nc_rxcount_reads,
+                        q40ov_rx_total & 0xFFU,
+                        q40ov_rx_total,
+                        q40ov_rx_remaining);
+            }
+
+            return (q40ov_rx_total & 0xFFU) << 24;
+        }
+
+        /*
+         * FE14DFE2 reads D6050004 after RX count validation.
+         *
+         * Preserve the effective baseline byte value (0x00).
+         * This is deliberately NOT a Panasonic/AudioIC model.
+         *
+         * Seeing this read proves FE14DFCA passed.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050004U &&
+            q40nc_rx_ready)
+        {
+            /*
+             * QEMU40OX-A — diagnostic Panasonic hot-plug witness.
+             *
+             * QEMU40OV runtime correlation proved:
+             *
+             *   READ-ARM #10 = READ 0x70:0x08 len=1
+             *   READ-ARM #11 = subsequent READ 0x70:0x1F len=1
+             *
+             * Static Panasonic state analysis shows bit 3 from
+             * the 0x08 result controls snapshot+16 / HOT PLUG.
+             *
+             * Return the minimum witness 0x08 ONLY for this one
+             * deterministic boot transaction.
+             *
+             * This is NOT yet a Panasonic register model.
+             */
+            unsigned int q40ox_rx_value = 0x00000000U;
+
+            /*
+             * QEMU40PAD-AD — synthetic base EDID.
+             *
+             * Same causal witness that PAD-AC proved via GDB,
+             * now delivered only through Canon's natural I2C
+             * receive stream.
+             *
+             * Contents intentionally minimal:
+             *
+             *   00 FF FF FF FF FF FF 00   EDID header
+             *   byte 18 = 01               version
+             *   byte 19 = 03               revision
+             *   byte126 = 00               no extensions
+             *   byte127 = 02               checksum
+             *
+             * Raw sum = 1536; modulo 256 = 0.
+             */
+            if (q40ad_active_edid &&
+                q40ov_rx_total == 64U &&
+                q40ov_rx_remaining > 0U)
+            {
+                unsigned int q40ad_pos =
+                    q40ov_rx_total - q40ov_rx_remaining;
+
+                unsigned int q40ad_off =
+                    (q40oz_active_reg & 0xFFU) + q40ad_pos;
+
+                unsigned int q40ad_value = 0U;
+
+                if (q40ad_off >= 1U && q40ad_off <= 6U)
+                    q40ad_value = 0xFFU;
+                else if (q40ad_off == 18U)
+                    q40ad_value = 0x01U;
+                else if (q40ad_off == 19U)
+                    q40ad_value = 0x03U;
+                else if (q40ad_off == 127U)
+                    q40ad_value = 0x02U;
+
+                if (q40ad_off < 128U)
+                {
+                    q40ox_rx_value = q40ad_value;
+                    q40ad_edid_bytes++;
+
+                    if (q40ad_off < 8U ||
+                        q40ad_off == 18U ||
+                        q40ad_off == 19U ||
+                        q40ad_off >= 124U)
+                    {
+                        fprintf(stderr,
+                                "[QEMU40PAD-AD] EDID BYTE "
+                                "off=%02X value=%02X "
+                                "rx=%u/%u\n",
+                                q40ad_off,
+                                q40ad_value,
+                                q40ov_rx_remaining,
+                                q40ov_rx_total);
+                    }
+                }
+            }
+
+            if (q40ou_read_arms == 10U &&
+                q40ov_rx_total == 1U &&
+                q40ov_rx_remaining == 1U)
+            {
+                q40ox_rx_value = 0x00000008U;
+
+                fprintf(stderr,
+                        "[QEMU40OX-A-I2C1] HOTPLUG WITNESS "
+                        "READ-ARM #10 -> RXDATA=08\\n");
+            }
+
+            /*
+             * QEMU40OZ-A:
+             *
+             * QEMU40OX-A runtime showed the second Panasonic
+             * register-0x08 read immediately precedes the
+             * KEY LOAD / HOT PLUG transition; the next 0x90
+             * polling phase is the current EDID-preread blocker.
+             *
+             * FE1C1A92 accepts 0x03:
+             *   bit0      = 1
+             *   (x & 56h) != 0
+             *
+             * Inject exactly once, only on Panasonic 0x90 len1.
+             */
+            /*
+             * QEMU40PAD-R:
+             *
+             * State-aware Panasonic reg90 witness.
+             *
+             * Only touch the guest-visible RX byte if:
+             *
+             *   - Panasonic transaction
+             *   - register 0x90
+             *   - one-byte receive
+             *   - lower dispatcher state == 2
+             *   - upper FE211672 state == 1
+             *   - fewer than two witnesses have been supplied
+             *
+             * lower state:
+             *   0x565F8 + 16 = 0x56608
+             *
+             * upper state:
+             *   0x470F8 + 44 = 0x47124
+             */
+            if (q40padr_status_injections < 2U &&
+                q40oz_active_panasonic &&
+                q40oz_active_reg == 0x90U &&
+                q40ov_rx_total == 1U &&
+                q40ov_rx_remaining == 1U)
+            {
+                uint32_t q40padr_lower_state = 0;
+                uint32_t q40padr_upper_state = 0;
+                unsigned char q40padr_reset7 = 0;
+
+                cpu_physical_memory_read(
+                    0x00056608U,
+                    &q40padr_lower_state,
+                    sizeof(q40padr_lower_state));
+
+                cpu_physical_memory_read(
+                    0x00047124U,
+                    &q40padr_upper_state,
+                    sizeof(q40padr_upper_state));
+
+                cpu_physical_memory_read(
+                    0x00047087U,
+                    &q40padr_reset7,
+                    sizeof(q40padr_reset7));
+
+                if (q40padr_lower_state == 2U &&
+                    q40padr_upper_state == 1U)
+                {
+                    /*
+                     * QEMU40PAD-U:
+                     * diagnostic one-bit delta from PAD-R.
+                     *
+                     *   PAD-R = 0x03
+                     *   PAD-U = 0x13 = 0x03 | 0x10
+                     *
+                     * Preserve the already-proven bit0/bit1
+                     * behavior and add only RESET event bit4,
+                     * whose state3 consumer gates FE1C19B0.
+                     *
+                     * Synthetic witness only; this is NOT
+                     * claimed to be the real Panasonic value.
+                     */
+                    q40ox_rx_value = 0x00000013U;
+                    q40padr_status_injections++;
+
+                    fprintf(stderr,
+                            "[QEMU40PAD-U] BIT4 STATUS "
+                            "#%u reg90->13 "
+                            "LOW16=%u "
+                            "SM44=%u "
+                            "RESET7=%02X "
+                            "reg08_reads=%u\\n",
+                            q40padr_status_injections,
+                            q40padr_lower_state,
+                            q40padr_upper_state,
+                            q40padr_reset7,
+                            q40oz_panasonic_08_reads);
+                }
+            }
+
+            /*
+             * QEMU40PAD-Q:
+             * first-byte timeline for the first 512 Panasonic
+             * RX transactions.
+             *
+             * Diagnostic only. RAM is read, never written.
+             */
+            /*
+             * QEMU40PAD-S:
+             * Read-only microtrace in the exact lower=2 / upper=1
+             * window used by PAD-R.
+             *
+             * No guest RAM writes.
+             * No RX-value modification.
+             * Maximum 128 records.
+             */
+            if (q40pads_micro_count < 128U &&
+                q40oz_active_panasonic &&
+                q40ov_rx_total > 0U &&
+                q40ov_rx_remaining == q40ov_rx_total)
+            {
+                unsigned char q40pads_reset[24] = {0};
+                unsigned char q40pads_lower[32] = {0};
+                unsigned char q40pads_upper[48] = {0};
+                unsigned char q40pads_snap[92] = {0};
+
+                cpu_physical_memory_read(
+                    0x00047080U,
+                    q40pads_reset,
+                    sizeof(q40pads_reset));
+
+                cpu_physical_memory_read(
+                    0x000565F8U,
+                    q40pads_lower,
+                    sizeof(q40pads_lower));
+
+                cpu_physical_memory_read(
+                    0x000470F8U,
+                    q40pads_upper,
+                    sizeof(q40pads_upper));
+
+                cpu_physical_memory_read(
+                    0x00047098U,
+                    q40pads_snap,
+                    sizeof(q40pads_snap));
+
+                /*
+                 * LOW16 == 2 and SM44 == 1.
+                 * High bytes are checked as well so this is an exact
+                 * little-endian 32-bit state match, not just byte 0.
+                 */
+                if (q40pads_lower[16] == 2U &&
+                    q40pads_lower[17] == 0U &&
+                    q40pads_lower[18] == 0U &&
+                    q40pads_lower[19] == 0U &&
+                    q40pads_upper[44] == 1U &&
+                    q40pads_upper[45] == 0U &&
+                    q40pads_upper[46] == 0U &&
+                    q40pads_upper[47] == 0U)
+                {
+                    q40pads_micro_count++;
+
+                    fprintf(stderr,
+                        "[QEMU40PAD-S] RX #%u "
+                        "op=R reg=%02X len=%u data=%02X "
+                        "RST=%u "
+                        "RESET0=%02X%02X%02X%02X "
+                        "RESET4=%02X%02X%02X%02X "
+                        "RESET7=%02X "
+                        "RESET8=%02X%02X%02X%02X "
+                        "RESET12=%02X%02X%02X%02X "
+                        "RESET16=%02X%02X%02X%02X "
+                        "RESET20=%02X%02X%02X%02X "
+                        "LOW4=%02X "
+                        "LOW16=%02X%02X%02X%02X "
+                        "LOW20=%02X%02X%02X%02X "
+                        "LOW24=%02X%02X%02X%02X "
+                        "SM44=%02X%02X%02X%02X "
+                        "SNAP0=%02X%02X%02X%02X "
+                        "SNAP20=%02X%02X%02X%02X\n",
+
+                        q40pads_micro_count,
+                        q40oz_active_reg & 0xFFU,
+                        q40ov_rx_total,
+                        q40ox_rx_value & 0xFFU,
+
+                        (unsigned int) q40pads_reset[0],
+
+                        q40pads_reset[0],
+                        q40pads_reset[1],
+                        q40pads_reset[2],
+                        q40pads_reset[3],
+
+                        q40pads_reset[4],
+                        q40pads_reset[5],
+                        q40pads_reset[6],
+                        q40pads_reset[7],
+
+                        q40pads_reset[7],
+
+                        q40pads_reset[8],
+                        q40pads_reset[9],
+                        q40pads_reset[10],
+                        q40pads_reset[11],
+
+                        q40pads_reset[12],
+                        q40pads_reset[13],
+                        q40pads_reset[14],
+                        q40pads_reset[15],
+
+                        q40pads_reset[16],
+                        q40pads_reset[17],
+                        q40pads_reset[18],
+                        q40pads_reset[19],
+
+                        q40pads_reset[20],
+                        q40pads_reset[21],
+                        q40pads_reset[22],
+                        q40pads_reset[23],
+
+                        q40pads_lower[4],
+
+                        q40pads_lower[16],
+                        q40pads_lower[17],
+                        q40pads_lower[18],
+                        q40pads_lower[19],
+
+                        q40pads_lower[20],
+                        q40pads_lower[21],
+                        q40pads_lower[22],
+                        q40pads_lower[23],
+
+                        q40pads_lower[24],
+                        q40pads_lower[25],
+                        q40pads_lower[26],
+                        q40pads_lower[27],
+
+                        q40pads_upper[44],
+                        q40pads_upper[45],
+                        q40pads_upper[46],
+                        q40pads_upper[47],
+
+                        q40pads_snap[0],
+                        q40pads_snap[1],
+                        q40pads_snap[2],
+                        q40pads_snap[3],
+
+                        q40pads_snap[20],
+                        q40pads_snap[21],
+                        q40pads_snap[22],
+                        q40pads_snap[23]);
+                }
+            }
+
+            if (q40padp_timeline_count < 512U &&
+                q40oz_active_panasonic &&
+                q40ov_rx_total > 0U &&
+                q40ov_rx_remaining == q40ov_rx_total)
+            {
+                unsigned char q40padp_reset[24] = {0};
+                unsigned char q40padp_lower[32] = {0};
+                unsigned char q40padp_upper[48] = {0};
+                unsigned char q40padp_snap[92] = {0};
+
+                cpu_physical_memory_read(
+                    0x00047080U,
+                    q40padp_reset,
+                    sizeof(q40padp_reset));
+
+                cpu_physical_memory_read(
+                    0x000565F8U,
+                    q40padp_lower,
+                    sizeof(q40padp_lower));
+
+                cpu_physical_memory_read(
+                    0x000470F8U,
+                    q40padp_upper,
+                    sizeof(q40padp_upper));
+
+                cpu_physical_memory_read(
+                    0x00047098U,
+                    q40padp_snap,
+                    sizeof(q40padp_snap));
+
+                q40padp_timeline_count++;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-Q] RX #%u "
+                        "reg=%02X "
+                        "len=%u "
+                        "reg08_reads=%u "
+                        "RESET0=%02X%02X%02X%02X "
+                        "RESET7=%02X "
+                        "RESET12=%02X%02X%02X%02X "
+                        "LOW4=%02X "
+                        "LOW16=%02X%02X%02X%02X "
+                        "LOW20=%02X%02X%02X%02X "
+                        "LOW24=%02X%02X%02X%02X "
+                        "SM44=%02X%02X%02X%02X "
+                        "SNAP16=%02X%02X%02X%02X "
+                        "SNAP20=%02X%02X%02X%02X "
+                        "SNAP84=%02X%02X%02X%02X\n",
+                        q40padp_timeline_count,
+                        q40oz_active_reg & 0xFFU,
+                        q40ov_rx_total,
+                        q40oz_panasonic_08_reads,
+
+                        q40padp_reset[0],
+                        q40padp_reset[1],
+                        q40padp_reset[2],
+                        q40padp_reset[3],
+
+                        q40padp_reset[7],
+
+                        q40padp_reset[12],
+                        q40padp_reset[13],
+                        q40padp_reset[14],
+                        q40padp_reset[15],
+
+                        q40padp_lower[4],
+
+                        q40padp_lower[16],
+                        q40padp_lower[17],
+                        q40padp_lower[18],
+                        q40padp_lower[19],
+
+                        q40padp_lower[20],
+                        q40padp_lower[21],
+                        q40padp_lower[22],
+                        q40padp_lower[23],
+
+                        q40padp_lower[24],
+                        q40padp_lower[25],
+                        q40padp_lower[26],
+                        q40padp_lower[27],
+
+                        q40padp_upper[44],
+                        q40padp_upper[45],
+                        q40padp_upper[46],
+                        q40padp_upper[47],
+
+                        q40padp_snap[16],
+                        q40padp_snap[17],
+                        q40padp_snap[18],
+                        q40padp_snap[19],
+
+                        q40padp_snap[20],
+                        q40padp_snap[21],
+                        q40padp_snap[22],
+                        q40padp_snap[23],
+
+                        q40padp_snap[84],
+                        q40padp_snap[85],
+                        q40padp_snap[86],
+                        q40padp_snap[87]);
+            }
+
+            if (q40padg_reg90_snapshots < 8U &&
+                q40oz_active_panasonic &&
+                q40oz_active_reg == 0x90U &&
+                q40oz_panasonic_08_reads >= 2U &&
+                q40ov_rx_total == 1U &&
+                q40ov_rx_remaining == 1U)
+            {
+                /*
+                 * QEMU40PAD-F:
+                 * read-only guest RAM snapshot at the first
+                 * Panasonic 0x90 read after HOTPLUG.
+                 *
+                 * IMPORTANT:
+                 * q40ox_rx_value remains zero.
+                 * No synthetic 0x03 status is returned.
+                 */
+                unsigned char q40padf_tab[12] = {0};
+                unsigned char q40padf_ctr[8] = {0};
+                unsigned char q40padf_snap[92] = {0};
+                unsigned char q40padf_sm[48] = {0};
+                unsigned char q40padm_low[32] = {0};
+                unsigned char q40pado_reset[24] = {0};
+
+                cpu_physical_memory_read(
+                    0x00012F20U,
+                    q40padf_tab,
+                    sizeof(q40padf_tab));
+
+                cpu_physical_memory_read(
+                    0x00018BDCU,
+                    q40padf_ctr,
+                    sizeof(q40padf_ctr));
+
+                cpu_physical_memory_read(
+                    0x00047098U,
+                    q40padf_snap,
+                    sizeof(q40padf_snap));
+
+                cpu_physical_memory_read(
+                    0x000470F8U,
+                    q40padf_sm,
+                    sizeof(q40padf_sm));
+
+                /*
+                 * QEMU40PAD-M:
+                 * lower Panasonic/async dispatcher state.
+                 * Read-only diagnostic snapshot.
+                 */
+                cpu_physical_memory_read(
+                    0x000565F8U,
+                    q40padm_low,
+                    sizeof(q40padm_low));
+
+                /*
+                 * QEMU40PAD-O:
+                 * Canon Panasonic reset bridge @ 0x47080.
+                 * Read-only diagnostic snapshot.
+                 */
+                cpu_physical_memory_read(
+                    0x00047080U,
+                    q40pado_reset,
+                    sizeof(q40pado_reset));
+
+                q40padg_reg90_snapshots++;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-O] REG90 STATE #%u "
+                        "reg08_reads=%u "
+                        "RAM12F20="
+                            "%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X "
+                        "CTR=%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X "
+                        "LOW0="
+                            "%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X,"
+                            "%02X,%02X,%02X,%02X "
+                        "LOW16=%02X%02X%02X%02X "
+                        "LOW20=%02X%02X%02X%02X "
+                        "LOW24=%02X%02X%02X%02X "
+                        "LOW28=%02X%02X%02X%02X "
+                        "RESET0=%02X%02X%02X%02X "
+                        "RESET4=%02X%02X%02X%02X "
+                        "RESET8=%02X%02X%02X%02X "
+                        "RESET12=%02X%02X%02X%02X "
+                        "RESET16=%02X%02X%02X%02X "
+                        "RESET20=%02X%02X%02X%02X "
+                        "SNAP16=%02X%02X%02X%02X "
+                        "SNAP20=%02X%02X%02X%02X "
+                        "SNAP68=%02X%02X%02X%02X "
+                        "SNAP76=%02X%02X%02X%02X "
+                        "SNAP84=%02X%02X%02X%02X "
+                        "SM44=%02X%02X%02X%02X\n",
+                        q40padg_reg90_snapshots,
+                        q40oz_panasonic_08_reads,
+
+                        q40padf_tab[0],
+                        q40padf_tab[1],
+                        q40padf_tab[2],
+                        q40padf_tab[3],
+                        q40padf_tab[4],
+                        q40padf_tab[5],
+                        q40padf_tab[6],
+                        q40padf_tab[7],
+                        q40padf_tab[8],
+                        q40padf_tab[9],
+                        q40padf_tab[10],
+                        q40padf_tab[11],
+
+                        q40padf_ctr[0],
+                        q40padf_ctr[1],
+                        q40padf_ctr[2],
+                        q40padf_ctr[3],
+                        q40padf_ctr[4],
+                        q40padf_ctr[5],
+                        q40padf_ctr[6],
+                        q40padf_ctr[7],
+
+                        q40padm_low[0],
+                        q40padm_low[1],
+                        q40padm_low[2],
+                        q40padm_low[3],
+                        q40padm_low[4],
+                        q40padm_low[5],
+                        q40padm_low[6],
+                        q40padm_low[7],
+                        q40padm_low[8],
+                        q40padm_low[9],
+                        q40padm_low[10],
+                        q40padm_low[11],
+                        q40padm_low[12],
+                        q40padm_low[13],
+                        q40padm_low[14],
+                        q40padm_low[15],
+                        q40padm_low[16],
+                        q40padm_low[17],
+                        q40padm_low[18],
+                        q40padm_low[19],
+                        q40padm_low[20],
+                        q40padm_low[21],
+                        q40padm_low[22],
+                        q40padm_low[23],
+                        q40padm_low[24],
+                        q40padm_low[25],
+                        q40padm_low[26],
+                        q40padm_low[27],
+                        q40padm_low[28],
+                        q40padm_low[29],
+                        q40padm_low[30],
+                        q40padm_low[31],
+
+                        q40pado_reset[0],
+                        q40pado_reset[1],
+                        q40pado_reset[2],
+                        q40pado_reset[3],
+                        q40pado_reset[4],
+                        q40pado_reset[5],
+                        q40pado_reset[6],
+                        q40pado_reset[7],
+                        q40pado_reset[8],
+                        q40pado_reset[9],
+                        q40pado_reset[10],
+                        q40pado_reset[11],
+                        q40pado_reset[12],
+                        q40pado_reset[13],
+                        q40pado_reset[14],
+                        q40pado_reset[15],
+                        q40pado_reset[16],
+                        q40pado_reset[17],
+                        q40pado_reset[18],
+                        q40pado_reset[19],
+                        q40pado_reset[20],
+                        q40pado_reset[21],
+                        q40pado_reset[22],
+                        q40pado_reset[23],
+
+                        q40padf_snap[16],
+                        q40padf_snap[17],
+                        q40padf_snap[18],
+                        q40padf_snap[19],
+
+                        q40padf_snap[20],
+                        q40padf_snap[21],
+                        q40padf_snap[22],
+                        q40padf_snap[23],
+
+                        q40padf_snap[68],
+                        q40padf_snap[69],
+                        q40padf_snap[70],
+                        q40padf_snap[71],
+
+                        q40padf_snap[76],
+                        q40padf_snap[77],
+                        q40padf_snap[78],
+                        q40padf_snap[79],
+
+                        q40padf_snap[84],
+                        q40padf_snap[85],
+                        q40padf_snap[86],
+                        q40padf_snap[87],
+
+                        q40padf_sm[44],
+                        q40padf_sm[45],
+                        q40padf_sm[46],
+                        q40padf_sm[47]);
+            }
+
+            q40nc_rxdata_reads++;
+
+            if (q40nc_rxdata_reads <= 10 ||
+                (q40nc_rxdata_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40NC-I2C1] RXDATA #%u "
+                        "-> 00000000\n",
+                        q40nc_rxdata_reads);
+            }
+
+            /*
+             * QEMU40OV:
+             * Keep RX active until Canon has consumed every
+             * requested byte.
+             */
+            if (q40ov_rx_remaining > 0U)
+                q40ov_rx_remaining--;
+
+            if (q40ov_rx_remaining == 0U)
+            {
+                q40nc_rx_ready = 0;
+
+                /*
+                 * QEMU40ND:
+                 * RX payload has now been completely consumed.
+                 * Preserve controller-ready status until Canon
+                 * actually emits the read STOP command.
+                 */
+                q40nd_stop_pregate = 1;
+            }
+
+            if (q40nc_rxdata_reads <= 10 ||
+                (q40nc_rxdata_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40OV-I2C1] RXDATA consumed "
+                        "remaining=%u/%u\n",
+                        q40ov_rx_remaining,
+                        q40ov_rx_total);
+            }
+
+            return q40ox_rx_value;
+        }
+        /*
+         * QEMU40ND — STOP pre-gate status.
+         *
+         * FE14DC80..FE14DC92 requires:
+         *
+         *   D6050000 bit15 = 1
+         *   D6050000 bit8  = 1
+         *
+         * 0x02108100 is the already-proven good post-TIRQ
+         * controller status and also keeps bits 27/26 clear
+         * for the tail of FE14DCEA.
+         */
+        /*
+         * QEMU40NI:
+         * Same priority rule for ND's pre-STOP ready status.
+         *
+         * Do not clear q40nd_stop_pregate here: when the
+         * write-STOP latch is not active, ND remains unchanged.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            !q40nh_sirq_armed &&
+            q40nd_stop_pregate)
+        {
+            q40nd_stop_pregate_reads++;
+
+            if (q40nd_stop_pregate_reads <= 10 ||
+                (q40nd_stop_pregate_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40ND-I2C1] STOP-PREGATE READ #%u "
+                        "-> 02108100\n",
+                        q40nd_stop_pregate_reads);
+            }
+
+            return 0x02108100U;
+        }
+
+        /*
+         * FE14DCA6 loads the read-stop command from FE14DF1C:
+         *
+         *     0x20001880
+         *
+         * Do NOT synthesize SIRQ here.
+         * This probe only proves that Canon reaches and emits STOP.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x20001880U)
+        {
+            q40nd_read_stop_arms++;
+
+            if (q40nd_read_stop_arms <= 10 ||
+                (q40nd_read_stop_arms % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40ND-I2C1] READ-STOP ARM #%u "
+                        "D6050000=20001880\n",
+                        q40nd_read_stop_arms);
+            }
+
+            q40nd_stop_pregate = 0;
+
+            /*
+             * QEMU40NE:
+             * the STOP command has already been written and
+             * ND pre-gate status is now disabled.
+             *
+             * Latch SIRQ status and assert I2C1_SIRQ.
+             */
+            q40ne_sirq_armed = 1;
+            q40ne_sirq_count++;
+
+            if (q40ne_sirq_count <= 10 ||
+                (q40ne_sirq_count % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40NE-I2C1] SIRQ ARM #%u "
+                        "after READ-STOP 20001880 "
+                        "status=03420000 -> IRQ 0x12D\n",
+                        q40ne_sirq_count);
+            }
+
+            eos_trigger_int(0x12D, 1);
+
+
+            /*
+             * Deliberately no eos_trigger_int(0x12D, ...).
+             * Expected result is STOP event timeout.
+             */
+        }
+        /*
+         * QEMU40NE — SIRQ status.
+         *
+         * Keep it latched. Do NOT consume it on the first read;
+         * MS already demonstrated why one-shot status is wrong.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40ne_sirq_armed)
+        {
+            q40ne_status_reads++;
+
+            if (q40ne_status_reads <= 10 ||
+                (q40ne_status_reads % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40NE-I2C1] SIRQ STATUS READ #%u "
+                        "-> 03420000\n",
+                        q40ne_status_reads);
+            }
+
+            return 0x03420000U;
+        }
+
+        /*
+         * FE14DB44..46 writes the SIRQ acknowledge/status
+         * command. Static ROM bytes at FE14DE64 are consistent
+         * with 0x20000080.
+         *
+         * Clear only on that Canon write.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40ne_sirq_armed &&
+            value == 0x20000080U)
+        {
+            q40ne_ack_count++;
+
+            if (q40ne_ack_count <= 10 ||
+                (q40ne_ack_count % 1000U) == 0)
+            {
+                fprintf(stderr,
+                        "[QEMU40NE-I2C1] SIRQ ACK #%u "
+                        "value=20000080 -> clear latched SIRQ state\n",
+                        q40ne_ack_count);
+            }
+
+            q40ne_sirq_armed = 0;
+
+            /*
+             * QEMU40NG:
+             * do not call eos_trigger_int(0x12D, 0) here.
+             * delay=0 means another immediate interrupt.
+             */
+        }
+        /*
+         * QEMU40NH — unresolved CH2 WRITE STOP.
+         *
+         * Do not interfere with QEMU40NE read-STOP state.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x20000880U &&
+            !q40ne_sirq_armed)
+        {
+            q40nh_sirq_armed = 1;
+            q40nh_write_stop_count++;
+
+            fprintf(stderr,
+                    "[QEMU40NJ-I2C1] WRITE-STOP ARM #%u "
+                    "value=20000880 status=03020000 "
+                    "-> IRQ 0x12D\n",
+                    q40nh_write_stop_count);
+
+            /*
+             * delay=1: emit one interrupt.
+             */
+            eos_trigger_int(0x12D, 1);
+        }
+
+        /*
+         * Latched diagnostic status:
+         * only bit17 is asserted.
+         */
+        if (!(type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            q40nh_sirq_armed)
+        {
+            q40nh_status_reads++;
+
+            if (q40nh_status_reads <= 80)
+            {
+                fprintf(stderr,
+                        "[QEMU40NJ-I2C1] WRITE-STOP "
+                        "SIRQ STATUS #%u -> 03020000\n",
+                        q40nh_status_reads);
+            }
+
+            /*
+             * QEMU40NJ:
+             *
+             * QEMU40NI reached FE14E2C0 with raw 0x00020000
+             * and proved that WRITE STOP selects validator B:
+             *
+             *     mask     = 0x035E8300
+             *     expected = 0x03020000
+             *
+             * Supply that exact completion status.
+             */
+            return 0x03020000U;
+        }
+
+        /*
+         * Canon SIRQ ACK.
+         *
+         * IMPORTANT:
+         * eos_trigger_int(id,0) is NOT a deassert.
+         * Clear only our emulated latched state.
+         */
+        if ((type & MODE_WRITE) &&
+            address == 0xD6050000U &&
+            value == 0x20000080U &&
+            q40nh_sirq_armed)
+        {
+            q40nh_ack_count++;
+
+            fprintf(stderr,
+                    "[QEMU40NJ-I2C1] WRITE-STOP "
+                    "SIRQ ACK #%u value=20000080\n",
+                    q40nh_ack_count);
+
+            q40nh_sirq_armed = 0;
+        }
+    }
+
+
+    /*
+     * QEMU40JH — 5D4 APROC candidate IRQ 0x37 causal probe.
+     *
+     * QEMU40JG-R2 showed:
+     *   - D206C channel 3 is configured/armed;
+     *   - IRQ 0x37 is enabled immediately afterwards;
+     *   - IRQ 0x37 is never observed firing;
+     *   - FE3978DC later sets APROC +0x28C = 1;
+     *   - FE29A164 / PathDone never run.
+     *
+     * Diagnostic only:
+     * trigger IRQ 0x37 exactly once after the APROC operation
+     * is genuinely pending. This is NOT a hardware model.
+     */
+    static unsigned int q40jh_aproc_seen = 0;
+    static unsigned int q40jh_irq37_fired = 0;
+
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        /*
+         * Runtime marker for APROC channel-3 initialization.
+         */
+        if (address == 0xD206C240U &&
+            (type & MODE_WRITE) &&
+            value == 1)
+        {
+            q40jh_aproc_seen = 1;
+
+            fprintf(stderr,
+                    "[QEMU40JH-IRQ37] APROC channel3 armed\n");
+        }
+
+        /*
+         * Once the high-level APROC driver has +0x28C == 1,
+         * synthesize candidate IRQ 0x37 exactly once.
+         *
+         * 0x0004F2A0 + 0x28C = 0x0004F52C.
+         */
+        if (q40jh_aproc_seen && !q40jh_irq37_fired)
+        {
+            uint32_t q40jh_pending = 0;
+
+            cpu_physical_memory_read(
+                0x0004F52CU,
+                &q40jh_pending,
+                sizeof(q40jh_pending));
+
+            if (q40jh_pending == 1)
+            {
+                q40jh_irq37_fired = 1;
+
+                fprintf(stderr,
+                        "[QEMU40JH-IRQ37] +28C=1 "
+                        "-> candidate IRQ 0x37\n");
+
+                eos_trigger_int(0x37, 1);
+            }
+        }
+    }
+
+    /*
+     * QEMU40JG — 5D4 APROC / ICU correlation.
+     *
+     * Diagnostic only.
+     * No MMIO state, interrupt state or return values are modified.
+     */
+    static unsigned int q40jg_aproc_channel_seen = 0;
+
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        /*
+         * Channel-3 lifecycle marker identified by QEMU40JF.
+         */
+        if (address == 0xD206C240U &&
+            (type & MODE_WRITE))
+        {
+            if (value == 1)
+                q40jg_aproc_channel_seen = 1;
+
+            fprintf(stderr,
+                    "[QEMU40JG-APROC] pc=%08X lr=%08X "
+                    "D206C240=%08X seen=%u\n",
+                    CURRENT_CPU->env.regs[15],
+                    CURRENT_CPU->env.regs[14],
+                    value,
+                    q40jg_aproc_channel_seen);
+        }
+
+        /*
+         * QEMU40NK — retired high-volume ICU diagnostics.
+         *
+         * QEMU40JG-ICU-ENABLE and QEMU40JG-ICU-FIRE were useful
+         * while correlating APROC with DIGIC 6 interrupt activity,
+         * but they generate extremely high log volume during normal
+         * firmware execution.
+         *
+         * Logging only is retired here. No MMIO, IRQ, APROC or
+         * controller behaviour is changed.
+         */
+    }
+
+    /*
+     * QEMU40JF — 5D4 D206C/APROC controller trace.
+     *
+     * Diagnostic only.
+     * No MMIO state, return value or interrupt behaviour is modified.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        address >= 0xD206C000U &&
+        address <= 0xD206C3FFU)
+    {
+    }
+
+    /*
+     * QEMU40IX diagnostic only.
+     *
+     * Trace before EOSRegionHandler dispatch so we can distinguish
+     * "no D800 accesses" from "D800 routed somewhere unexpected".
+     *
+     * No MMIO state, return value or IRQ behaviour is changed.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        /* Known-good build/runtime sentinel: RTC launch definitely occurs. */
+        if (address == 0xD9840A04)
+        {
+        }
+
+        /* Wide APROC candidate window. */
+        if (address >= 0xD8000000 && address <= 0xD8000FFF &&
+            address != 0xD80003F4)
+        {
+        }
+    }
+
     EOSRegionHandler *handler = eos_find_handler(address);
 
     if(handler)
@@ -2438,6 +4409,19 @@ unsigned int eos_trigger_int(unsigned int id, unsigned int delay)
         if (qemu_loglevel_mask(CPU_LOG_INT)) {
             fprintf(stderr, "[EOS] trigger int 0x%02X\n", id);
         }
+        if (id == 0x147)
+        {
+            qemu40_sio3_active_source = qemu40_sio3_next_source;
+            qemu40_sio3_pending_source = 0;
+            qemu40_sio3_next_source = 0;
+
+            qemu40_sio3_record(
+                1,
+                qemu40_sio3_active_source,
+                eos_state->irq_id,
+                eos_state->irq_schedule[id]);
+        }
+
         eos_state->irq_id = id;
         eos_state->irq_enabled[eos_state->irq_id] = 0;
         cpu_interrupt(CPU(CURRENT_CPU), CPU_INTERRUPT_HARD);
@@ -2451,7 +4435,22 @@ unsigned int eos_trigger_int(unsigned int id, unsigned int delay)
         {
             delay = 1;
         }
+        if (id == 0x147)
+        {
+            qemu40_sio3_pending_source = qemu40_sio3_next_source;
+            qemu40_sio3_next_source = 0;
+        }
+
         eos_state->irq_schedule[id] = MAX(delay, 1);
+
+        if (id == 0x147)
+        {
+            qemu40_sio3_record(
+                2,
+                qemu40_sio3_pending_source,
+                eos_state->irq_id,
+                eos_state->irq_schedule[id]);
+        }
     }
     return 0;
 }
@@ -2537,10 +4536,680 @@ unsigned int eos_handle_dummy_dev_digicX(unsigned int parm, unsigned int address
     return ret;
 }
 
+unsigned int eos_handle_digic6(unsigned int parm,
+                               unsigned int address,
+                               unsigned char type,
+                               unsigned int value);
+
 unsigned int eos_handle_digicX(unsigned int parm, unsigned int address, unsigned char type, unsigned int value)
 {
+
+    /*
+     * QEMU40PDA:
+     * passive 5D4 display-controller page tracer.
+     * No return-value or state modification.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        address >= 0xD2018000U &&
+        address <= 0xD2018FFFU)
+    {
+        fprintf(stderr,
+            "[QEMU40PDA-DISP] %c "
+            "ADDR=%08X VALUE=%08X TYPE=%02X "
+            "BMP=%08X PITCH=%u WH=%ux%u\n",
+            (type & MODE_WRITE) ? 'W' : 'R',
+            address,
+            value,
+            type,
+            eos_state->disp.bmp_vram,
+            eos_state->disp.bmp_pitch,
+            eos_state->disp.width,
+            eos_state->disp.height);
+    }
+
     const char *msg = 0;
     unsigned int ret = 0;
+
+    unsigned int q40pdb_routed_ret = 0;
+    /*
+     * QEMU40DK diagnostic, 5D4 only.
+     *
+     * Canon FW 1.3.3:
+     *   D2000208 = 1 starts channel 0 operation.
+     *   IRQ 0x8D callback reads D2000400 pending bits.
+     *   Callback acknowledges a bit by writing ~bit to D2000400.
+     *
+     * This is diagnostic emulation only; do not treat as final hardware model.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+
+        /*
+         * QEMU40FQ diagnostic only:
+         * log raw writes to all four D200 TX FIFO channels.
+         * No state or MMIO behaviour is changed.
+         */
+/*
+ * QEMU40GO-R — diagnostic PCommMem ownership return.
+ *
+ * FE32F7A8 sends:
+ *   TX0 word0 = 01 02 <count> 20
+ *   TX0 word1 = PCommMem descriptor pointer
+ */
+static unsigned int q40go_tx0_phase = 0;
+static uint32_t q40go_tx0_header = 0;
+
+if (address == 0xD2000004 && (type & MODE_WRITE))
+{
+    if (!q40go_tx0_phase)
+    {
+        q40go_tx0_header = (uint32_t) value;
+        q40go_tx0_phase = 1;
+    }
+    else
+    {
+        uint32_t q40go_desc = (uint32_t) value;
+
+        q40go_tx0_phase = 0;
+
+        if (((q40go_tx0_header & 0xFFFF00FFU) == 0x01020020U) &&
+            q40go_desc)
+        {
+            uint8_t q40go_zero = 0;
+
+            cpu_physical_memory_write(
+                (hwaddr) (q40go_desc - 4),
+                &q40go_zero,
+                1
+            );
+
+            fprintf(stderr,
+                    "[QEMU40GO-PCOMM] remote release "
+                    "header=%08x descriptor=%08x flag=%08x\n",
+                    q40go_tx0_header,
+                    q40go_desc,
+                    q40go_desc - 4);
+        }
+    }
+}
+
+        if ((address == 0xD2000004) ||
+            (address == 0xD2000084) ||
+            (address == 0xD2000104) ||
+            (address == 0xD2000184))
+        {
+            /* QEMU40NO: obsolete raw D200 trace retired. */
+
+        }
+
+
+        /*
+         * QEMU40JY-TX2 — diagnostic D200 TX channel 2 completion.
+         *
+         * Canon FW 5D4.133 proves:
+         *
+         *   TX2 FIFO = D2000084
+         *   TX2 IRQ  = 0x2D
+         *   TX ISR   = FE1FC71E
+         *   TX2 ACK  = D200008C <- 0
+         *
+         * FE1FC71E also releases the Postman synchronization
+         * handle and decrements the outstanding TX count.
+         *
+         * Diagnostic only: trigger TX completion after the second
+         * FIFO word. No RX-side protocol is synthesized here.
+         */
+        static unsigned int q40jy_tx2_phase = 0;
+        static unsigned int q40jy_tx2_irq = 0;
+
+        if (address == 0xD2000084 && (type & MODE_WRITE))
+        {
+            if (!q40jy_tx2_phase)
+            {
+                q40jy_tx2_phase = 1;
+
+                fprintf(stderr,
+                        "[QEMU40JY-TX2] word0=%08x\n",
+                        (uint32_t) value);
+            }
+            else
+            {
+                q40jy_tx2_phase = 0;
+                q40jy_tx2_irq = 1;
+
+                fprintf(stderr,
+                        "[QEMU40JY-TX2] word1=%08x -> IRQ 0x2D\n",
+                        (uint32_t) value);
+
+                eos_trigger_int(0x2D, 1);
+            }
+
+            return 0;
+        }
+
+        if (q40jy_tx2_irq &&
+            address == 0xD200008C &&
+            (type & MODE_WRITE) &&
+            value == 0)
+        {
+            fprintf(stderr,
+                    "[QEMU40JY-TX2] ACK D200008C -> "
+                    "clear emulated IRQ state 0x2D\n");
+
+            q40jy_tx2_irq = 0;
+            /* QEMU40NN: ACK clears q40jy_tx2_irq; do not retrigger IRQ 0x2D. */
+
+            return 0;
+        }
+
+        static unsigned int q40dk_d200_pending = 0;
+
+        /*
+         * QEMU40EN diagnostic, 5D4 only.
+         *
+         * ResManagPostS sends:
+         *
+         *   D2000004 <- 0x01000020
+         *   D2000004 <- 0x00000000
+         *
+         * Channel pairing recovered from Canon FW:
+         *
+         *   TX channel 0 -> IRQ 0x0D
+         *   RX channel 1 -> IRQ 0x1C
+         *
+         * RX channel 1 exposes:
+         *
+         *   D2000040 : number of FIFO words
+         *   D2000054 : FIFO pop
+         *
+         * This is a causal diagnostic only, not a final SubCPU model.
+         */
+        static unsigned int q40en_target_armed = 0;
+        static unsigned int q40en_rx_fifo[2] = { 0, 0 };
+        static unsigned int q40en_rx_count = 0;
+        static unsigned int q40en_rx_pos = 0;
+        static unsigned int q40en_tx_irq = 0;
+
+/*
+ * QEMU40GA:
+ * TX4 completion state.
+ */
+static unsigned int q40ga_tx4_word = 0;
+static unsigned int q40ga_tx4_irq = 0;
+
+/* QEMU40GE: TX4 request header + paired RX5 FIFO */
+static unsigned int q40ge_tx4_header = 0;
+static unsigned int q40ge_rx5_fifo[2] = { 0, 0 };
+static unsigned int q40ge_rx5_count = 0;
+static unsigned int q40ge_rx5_pos = 0;
+static unsigned int q40ge_rx5_irq = 0;
+
+/*
+ * QEMU40IG:
+ * One deferred Postman RX5 reply.
+ *
+ * The current diagnostic RX5 model only stores one two-word reply.
+ * During 5D4 startup, ShtCapture 0x01000000 and OmarSysInfo
+ * 0x00000200 can overlap. Preserve the already-proven reply rather
+ * than overwriting it.
+ */
+static unsigned int q40ig_rx5_pending_header = 0;
+
+        /*
+         * QEMU40EN:
+         * Capture only the exact ResManagPostS request currently under test.
+         * All unrelated D2000004 traffic keeps the previous behaviour.
+         */
+        /*
+         * QEMU40FR:
+         * Extend the proven TX0 -> RX1 diagnostic transport to the
+         * second ResManagPostS request observed during ShootCapture.
+         *
+         * Known requests:
+         *
+         *   01000020 00000000
+         *   01020220 bfe00004
+         *
+         * Return the same control/event header with result 0.
+         * This is still diagnostic protocol emulation, not final HW.
+         */
+/*
+ * QEMU40GA:
+ *
+ * D200 TX4 FIFO = 0xD2000104
+ * D200 TX4 ACK  = 0xD200010C
+ * TX4 IRQ       = 0x4D
+ *
+ * FE1FC98C emits two FIFO words per transaction.
+ * The real Canon FE1FC71E completion handler performs
+ * ACK and releases the channel semaphore.
+ */
+/*
+ * QEMU40GE:
+ *
+ * RX5 COUNT = D2000140
+ * RX5 FIFO  = D2000154
+ * RX5 IRQ   = 0x5C
+ *
+ * FE1FC768 is the real Canon Postman RX dispatcher.
+ */
+if (address == 0xD2000140 && (type & MODE_READ))
+{
+    fprintf(stderr,
+            "[QEMU40GE-RX5] COUNT -> %u\n",
+            q40ge_rx5_count);
+
+    return q40ge_rx5_count;
+}
+
+if (address == 0xD2000154 &&
+    (type & MODE_READ) &&
+    q40ge_rx5_count)
+{
+    unsigned int v = q40ge_rx5_fifo[q40ge_rx5_pos++];
+
+    q40ge_rx5_count--;
+
+    fprintf(stderr,
+            "[QEMU40GE-RX5] FIFO[%u] -> %08x\n",
+            q40ge_rx5_pos - 1,
+            v);
+
+    if (!q40ge_rx5_count)
+    {
+        q40ge_rx5_pos = 0;
+
+        if (q40ge_rx5_irq)
+        {
+            q40ge_rx5_irq = 0;
+
+            fprintf(stderr,
+                    "[QEMU40GE-RX5] drained -> clear emulated IRQ state 0x5C\n");
+
+            /* QEMU40NN: RX drain clears q40ge_rx5_irq; do not retrigger IRQ 0x5C. */
+
+            /*
+             * QEMU40IG:
+             * If a second supported TX4 request completed while RX5
+             * was still occupied, expose that reply now.
+             */
+            if (q40ig_rx5_pending_header)
+            {
+                q40ge_rx5_fifo[0] = q40ig_rx5_pending_header;
+                q40ge_rx5_fifo[1] = 0x00000000;
+                q40ge_rx5_count = 2;
+                q40ge_rx5_pos = 0;
+                q40ge_rx5_irq = 1;
+
+                fprintf(stderr,
+                        "[QEMU40IG-RX5] dequeue pending header=%08x "
+                        "payload=00000000 -> IRQ 0x5C\n",
+                        q40ig_rx5_pending_header);
+
+                q40ig_rx5_pending_header = 0;
+                eos_trigger_int(0x5C, 1);
+            }
+        }
+    }
+
+    return v;
+}
+
+if (address == 0xD2000104 && (type & MODE_WRITE))
+{
+    if (!q40ga_tx4_word)
+    {
+        q40ga_tx4_word = 1;
+        q40ge_tx4_header = (uint32_t) value;
+
+        fprintf(stderr,
+                "[QEMU40GA-TX4] word0=%08x\n",
+                (uint32_t) value);
+    }
+    else
+    {
+        q40ga_tx4_word = 0;
+        q40ga_tx4_irq = 1;
+
+        fprintf(stderr,
+                "[QEMU40GA-TX4] word1=%08x -> IRQ 0x4D\n",
+                (uint32_t) value);
+
+        eos_trigger_int(0x4D, 1);
+    }
+
+    return 0;
+}
+
+if (q40ga_tx4_irq &&
+    address == 0xD200010C &&
+    (type & MODE_WRITE) &&
+    value == 0)
+{
+    fprintf(stderr,
+            "[QEMU40GA-TX4] ACK D200010C -> clear emulated IRQ state 0x4D\n");
+
+    q40ga_tx4_irq = 0;
+    /* QEMU40NN: ACK clears q40ga_tx4_irq; do not retrigger IRQ 0x4D. */
+
+    /*
+     * QEMU40GE/QEMU40IG:
+     *
+     * Known paired TX4 -> RX5 asynchronous completions:
+     *
+     *   0x01000000 : ShtCapturePath
+     *   0x00000200 : OmarSysInfo, callback slot 2, status 0
+     *
+     * Do not overwrite a reply that Canon has not consumed yet.
+     */
+    if (q40ge_tx4_header == 0x01000000 ||
+        q40ge_tx4_header == 0x00000200)
+    {
+        unsigned int reply_header = q40ge_tx4_header;
+
+        if (!q40ge_rx5_count)
+        {
+            q40ge_rx5_fifo[0] = reply_header;
+            q40ge_rx5_fifo[1] = 0x00000000;
+            q40ge_rx5_count = 2;
+            q40ge_rx5_pos = 0;
+            q40ge_rx5_irq = 1;
+
+            fprintf(stderr,
+                    "[QEMU40IG-RX5] queue header=%08x "
+                    "payload=00000000 -> IRQ 0x5C\n",
+                    reply_header);
+
+            eos_trigger_int(0x5C, 1);
+        }
+        else if (!q40ig_rx5_pending_header)
+        {
+            q40ig_rx5_pending_header = reply_header;
+
+            fprintf(stderr,
+                    "[QEMU40IG-RX5] defer header=%08x "
+                    "while RX5 count=%u\n",
+                    reply_header,
+                    q40ge_rx5_count);
+        }
+        else
+        {
+            fprintf(stderr,
+                    "[QEMU40IG-RX5] pending overflow: "
+                    "active_count=%u pending=%08x new=%08x\n",
+                    q40ge_rx5_count,
+                    q40ig_rx5_pending_header,
+                    reply_header);
+        }
+    }
+
+    return 0;
+}
+
+        if (address == 0xD2000004 && (type & MODE_WRITE))
+        {
+            /*
+             * QEMU40FX:
+             *
+             * FE32F7A8 takes a descriptor word count in r1:
+             *
+             *   allocation size = count * 4
+             *   command         = 0x00020020 | (count << 8)
+             *
+             * FE1FC98C adds the upper transport byte 0x01.
+             *
+             * Therefore the complete allocation family is:
+             *
+             *   0x0102CC20
+             *
+             * where CC is the descriptor word count.
+             */
+            if (value == 0x01000020 ||
+                (value & 0xFFFF00FF) == 0x01020020)
+            {
+                q40en_target_armed = value;
+
+                fprintf(stderr,
+                        "[QEMU40EN-D200] TX0 header=%08x captured\n",
+                        value);
+
+                return 0;
+            }
+
+            if (q40en_target_armed)
+            {
+                unsigned int q40fr_header = q40en_target_armed;
+                /*
+                 * QEMU40FX:
+                 * Allocation payload is the temporary descriptor
+                 * buffer allocated by FE1DE260; its address is
+                 * dynamic and must only be required to be nonzero.
+                 */
+                unsigned int q40fx_is_alloc =
+                    ((q40fr_header & 0xFFFF00FF) ==
+                     0x01020020);
+
+                unsigned int q40fr_valid =
+                    ((q40fr_header == 0x01000020 &&
+                      value == 0x00000000) ||
+                     (q40fx_is_alloc &&
+                      value != 0x00000000));
+
+                q40en_target_armed = 0;
+
+                fprintf(stderr,
+                        "[QEMU40EN-D200] TX0 payload=%08x\n",
+                        value);
+
+                if (q40fr_valid)
+                {
+                    /*
+                     * RX reply:
+                     * preserve callback/event selector from request,
+                     * return result code 0.
+                     */
+                    q40en_rx_fifo[0] = q40fr_header;
+
+                    /*
+                     * QEMU40FU diagnostic:
+                     * FE32F688 stores RX word #2 as the return value
+                     * of FE32F7A8.  The 01020220 transaction allocates
+                     * a SubCPU-side resource/handle, and its caller
+                     * rejects handle 0 at ShResMngPwrcntWrapper:295.
+                     *
+                     * Use handle 1 only to test this causal contract.
+                     */
+                    /*
+                     * QEMU40FX diagnostic resource allocator.
+                     *
+                     * Every FE32F7A8 allocation must return a
+                     * distinct nonzero handle.
+                     */
+                    if (q40fx_is_alloc)
+                    {
+                        static unsigned int q40fx_next_handle = 1;
+
+                        q40en_rx_fifo[1] = q40fx_next_handle++;
+
+                        if (q40fx_next_handle == 0)
+                            q40fx_next_handle = 1;
+
+                        fprintf(stderr,
+                                "[QEMU40FX-D200] allocation "
+                                "count=%u descriptor=%08x "
+                                "handle=%u\n",
+                                (q40fr_header >> 8) & 0xFF,
+                                value,
+                                q40en_rx_fifo[1]);
+                    }
+                    else
+                    {
+                        q40en_rx_fifo[1] = 0x00000000;
+                    }
+
+                    q40en_rx_count = 2;
+                    q40en_rx_pos = 0;
+
+                    q40en_tx_irq = 1;
+
+                    fprintf(stderr,
+                            "[QEMU40EN-D200] TX0 complete "
+                            "header=%08x -> IRQ 0x0D\n",
+                            q40fr_header);
+
+                    eos_trigger_int(0x0D, 1);
+
+                    fprintf(stderr,
+                            "[QEMU40FX-D200] RX1 queued count=2 "
+                            "header=%08x result=%08x "
+                            "-> IRQ 0x1C\n",
+                            q40fr_header,
+                            q40en_rx_fifo[1]);
+
+                    eos_trigger_int(0x1C, 1);
+                }
+
+                return 0;
+            }
+        }
+
+        /*
+         * FE1FC71E acknowledges TX channel 0 by clearing D200000C.
+         */
+        if (q40en_tx_irq &&
+            address == 0xD200000C &&
+            (type & MODE_WRITE) &&
+            value == 0)
+        {
+            fprintf(stderr,
+                    "[QEMU40EN-D200] TX0 ACK -> clear emulated IRQ state 0x0D\n");
+
+                /*
+                 * QEMU40FP diagnostic — second 5D4 Omar/MOCom completion.
+                 *
+                 * QEMU40FO proved:
+                 *   Omar 2->3 -> FE0E243A -> D200/SubCPU completion -> return
+                 * but Omar 3->4 / FE0E24BE never arrives.
+                 *
+                 * Fire one additional asynchronous IRQ 0x9C after the
+                 * D200 TX0 transaction has completed. Diagnostic only:
+                 * this deliberately couples two devices in order to test
+                 * causality, not to model the final hardware topology.
+                 */
+                if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+                {
+                    static int q40fp_omar_second_done = 0;
+
+                    if (!q40fp_omar_second_done)
+                    {
+                        q40fp_omar_second_done = 1;
+
+                        fprintf(stderr,
+                                "[QEMU40FP-OMAR] D200 TX0 ACK -> "
+                                "second IRQ 0x9C\n");
+
+                        eos_trigger_int(0x9C, 1);
+                    }
+                }
+
+
+            q40en_tx_irq = 0;
+            /* QEMU40NN: ACK clears q40en_tx_irq; do not retrigger IRQ 0x0D. */
+            return 0;
+        }
+
+        /*
+         * FE1FC768 receive dispatcher, physical RX channel 1.
+         */
+        if (address == 0xD2000040 &&
+            !(type & MODE_WRITE) &&
+            q40en_rx_count)
+        {
+            fprintf(stderr,
+                    "[QEMU40EN-D200] RX1 COUNT -> %u\n",
+                    q40en_rx_count);
+
+            return q40en_rx_count;
+        }
+
+        if (address == 0xD2000054 &&
+            !(type & MODE_WRITE) &&
+            q40en_rx_count)
+        {
+            unsigned int ret =
+                q40en_rx_fifo[q40en_rx_pos++];
+
+            fprintf(stderr,
+                    "[QEMU40EN-D200] RX1 FIFO[%u] -> %08x\n",
+                    q40en_rx_pos - 1,
+                    ret);
+
+            if (q40en_rx_pos >= q40en_rx_count)
+            {
+                q40en_rx_count = 0;
+                q40en_rx_pos = 0;
+
+                fprintf(stderr,
+                        "[QEMU40EN-D200] RX1 drained "
+                        "-> clear emulated IRQ state 0x1C\n");
+
+                /* QEMU40NN: RX drain clears q40en RX state; do not retrigger IRQ 0x1C. */
+            }
+
+            return ret;
+        }
+
+        if (address == 0xD2000208 &&
+            (type & MODE_WRITE) &&
+            value == 1)
+        {
+            q40dk_d200_pending |= 1;
+
+            fprintf(stderr,
+                    "[QEMU40DK-D200] D2000208=1 -> pending=%08x -> IRQ 0x8D\\n",
+                    q40dk_d200_pending);
+
+            eos_trigger_int(0x8D, 1);
+            return 0;
+        }
+
+        if (address == 0xD2000400)
+        {
+            if (type & MODE_WRITE)
+            {
+                fprintf(stderr,
+                        "[QEMU40DK-D200] D2000400 ACK value=%08x pending_before=%08x\\n",
+                        value, q40dk_d200_pending);
+
+                /*
+                 * Canon writes ~bit. AND semantics clears the acknowledged
+                 * pending bit while preserving any other pending bits.
+                 */
+                q40dk_d200_pending &= value;
+
+                fprintf(stderr,
+                        "[QEMU40DK-D200] pending_after=%08x\\n",
+                        q40dk_d200_pending);
+
+                /*
+                 * QEMU40NN-R2:
+                 * ACK state was already applied with:
+                 *
+                 *     q40dk_d200_pending &= value;
+                 *
+                 * Do not call eos_trigger_int(0x8D, 0):
+                 * delay=0 would generate another immediate IRQ.
+                 */
+                return 0;
+            }
+
+            fprintf(stderr,
+                    "[QEMU40DK-D200] D2000400 READ -> %08x\\n",
+                    q40dk_d200_pending);
+
+            return q40dk_d200_pending;
+        }
+    }
 
     if (address >= 0xD2230000 && address <= 0xD223FFFF) {
         /* 0x0xD223xxxxx, 0xD22390C2 on R6 */
@@ -2550,6 +5219,144 @@ unsigned int eos_handle_digicX(unsigned int parm, unsigned int address, unsigned
         }
         msg = "R6 GPIO?";
         ret = 0;
+    }
+
+
+
+    /*
+     * QEMU40PDK-5D4-3BPP:
+     * consume the natural 5D4 panel-plane descriptor fields required by
+     * the existing QEMU display state.
+     *
+     * Observed natural relationship:
+     *   D20182E8 = 0x0132C500
+     *   surface  = 0x4132C500
+     *
+     * The 0x40000000 alias restoration is intentionally restricted to
+     * MODEL_NAME_5D4 and this descriptor register.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        (type & MODE_WRITE))
+    {
+        if (address == 0xD20182E8U)
+        {
+            uint32_t panel_surface = value | 0x40000000U;
+
+            eos_state->disp.bmp_vram = panel_surface;
+            eos_state->disp.invalidate = 1;
+
+            fprintf(stderr,
+                    "[QEMU40PDK-SCANOUT] BASE "
+                    "REG=%08X RAM=%08X\n",
+                    value,
+                    panel_surface);
+        }
+        else if (address == 0xD20182ECU)
+        {
+            eos_state->disp.bmp_pitch = value;
+            eos_state->disp.invalidate = 1;
+
+            fprintf(stderr,
+                    "[QEMU40PDK-SCANOUT] STRIDE=%u\n",
+                    value);
+        }
+        else if (address == 0xD20182F0U)
+        {
+            uint32_t active_bytes = value & 0xFFFFU;
+            uint32_t active_height = value >> 16;
+
+            eos_state->disp.invalidate = 1;
+
+            fprintf(stderr,
+                    "[QEMU40PDK-SCANOUT] ACTIVE "
+                    "HEIGHT=%u ROW_BYTES=%u\n",
+                    active_height,
+                    active_bytes);
+        }
+    }
+
+    /*
+     * QEMU40PDC:
+     * passive attribution of natural 5D4 panel-controller accesses.
+     * No state or return-value modification.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        (address == 0xD2018200U ||
+         address == 0xD2018220U ||
+         address == 0xD2018380U ||
+         address == 0xD20182B8U ||
+         address == 0xD20182E0U ||
+         address == 0xD20182E4U ||
+         address == 0xD20182E8U ||
+         address == 0xD20182ECU ||
+         address == 0xD20182F0U ||
+         address == 0xD20182F4U ||
+         address == 0xD20182F8U ||
+         address == 0xD2018318U ||
+         address == 0xD2018020U))
+    {
+        fprintf(stderr,
+                "[QEMU40PDC-PANEL] %c "
+                "PC=%08X LR=%08X "
+                "ADDR=%08X VALUE=%08X TYPE=%02X "
+                "BMP=%08X PITCH=%u WH=%ux%u\n",
+                (type & MODE_WRITE) ? 'W' : 'R',
+                CURRENT_CPU->env.regs[15],
+                CURRENT_CPU->env.regs[14],
+                address,
+                value,
+                type,
+                eos_state->disp.bmp_vram,
+                eos_state->disp.bmp_pitch,
+                eos_state->disp.width,
+                eos_state->disp.height);
+    }
+
+    /*
+     * QEMU40PDB — 5D4 D201 display routing correction experiment.
+     *
+     * The MMIO map routes D2000000-D201FFFF through eos_handle_digicX,
+     * shadowing the generic DIGIC6 handler.  These six addresses already
+     * have explicit 5D4 semantics in eos_handle_digic6; do not invent any
+     * new register behaviour here.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        (address == 0xD2018200U ||
+         address == 0xD2018230U ||
+         address == 0xD2018228U ||
+         address == 0xD201822CU ||
+         address == 0xD2018398U ||
+         address == 0xD2018390U))
+    {
+        fprintf(stderr,
+                "[QEMU40PDB-DISPROUTE] BEFORE "
+                "pc=%08X lr=%08X addr=%08X value=%08X type=%02X "
+                "BMP=%08X PITCH=%u WH=%ux%u\n",
+                CURRENT_CPU->env.regs[15],
+                CURRENT_CPU->env.regs[14],
+                address,
+                value,
+                type,
+                eos_state->disp.bmp_vram,
+                eos_state->disp.bmp_pitch,
+                eos_state->disp.width,
+                eos_state->disp.height);
+
+        q40pdb_routed_ret =
+            eos_handle_digic6(parm, address, type, value);
+
+        fprintf(stderr,
+                "[QEMU40PDB-DISPROUTE] AFTER  "
+                "addr=%08X ret=%08X "
+                "BMP=%08X PITCH=%u WH=%ux%u\n",
+                address,
+                q40pdb_routed_ret,
+                eos_state->disp.bmp_vram,
+                eos_state->disp.bmp_pitch,
+                eos_state->disp.width,
+                eos_state->disp.height);
+
+        return q40pdb_routed_ret;
     }
 
     switch (address)
@@ -2737,6 +5544,15 @@ unsigned int eos_handle_intengine(unsigned int parm, unsigned int address, unsig
                 msg_arg2 = eos_state->irq_id;
                 ret = eos_state->irq_id << ((address & 0xF) ? 2 : 0);
 
+                if (eos_state->irq_id == 0x147)
+                {
+                    qemu40_sio3_record(
+                        4,
+                        qemu40_sio3_active_source,
+                        eos_state->irq_id,
+                        eos_state->irq_schedule[0x147]);
+                }
+
                 /* this register resets on read (subsequent reads should report 0) */
                 eos_state->irq_id = 0;
                 cpu_reset_interrupt(CPU(CURRENT_CPU), CPU_INTERRUPT_HARD);
@@ -2761,6 +5577,15 @@ unsigned int eos_handle_intengine(unsigned int parm, unsigned int address, unsig
                 msg = "Enabled interrupt %02Xh";
                 msg_arg1 = value;
                 eos_state->irq_enabled[value] = 1;
+
+                if (value == 0x147)
+                {
+                    qemu40_sio3_record(
+                        5,
+                        qemu40_sio3_active_source,
+                        eos_state->irq_id,
+                        eos_state->irq_schedule[0x147]);
+                }
 
                 /* we shouldn't reset s->irq_id here (we already reset it on read) */
                 /* if we reset it here also, it will trigger interrupt 0 incorrectly (on race conditions) */
@@ -6623,6 +9448,7 @@ unsigned int eos_handle_memdiv(unsigned int parm, unsigned int address, unsigned
 
     switch (address & 0xFFFF)
     {
+        case 0x0A24: /* 5D4: 0xD9000A20 + 4 */
         case 0x1604:
         {
             msg = "MEMDIV_SETUP";
@@ -6731,12 +9557,973 @@ unsigned int eos_handle_boot_digicX(unsigned int parm, unsigned int address, uns
 }
 
 
+
+/*
+ * QEMU40PDZ-ZICO7B
+ *
+ * Experimental 5D4 FW 1.3.3 Zico/MZRM opcode 0x7B renderer.
+ *
+ * RE evidence:
+ *   9999 asset
+ *   1112 logical canvas
+ *   BBB0 / BBB1 group colours
+ *   CC10
+ *       AAA0 path opcodes:
+ *           00 end/close subpath
+ *           02 move(x,y)
+ *           04 line(x,y)
+ *           06 horizontal(x)
+ *           08 vertical(y)
+ *           0A quadratic(cx,cy,x,y)
+ *       AAA1 coordinate stream
+ *   2222 / AAAC path-to-group mapping
+ *
+ * This first renderer deliberately implements only the observed
+ * 5D4 startup schema. CCC4 and AAAC low-bit semantics remain ignored.
+ *
+ * Rendering is performed directly at the requested bitmap size and
+ * composited into the observed Canon RGBA surface.
+ */
+
+#define Q40PDZ_MAX_PATHS   64
+#define Q40PDZ_MAX_COLORS   8
+#define Q40PDZ_MAX_SEGS  1024
+#define Q40PDZ_MAX_OPS    256
+#define Q40PDZ_MAX_COORDS 512
+#define Q40PDZ_QSTEPS       8
+
+typedef struct
+{
+    hwaddr a0;
+    hwaddr a1;
+} Q40PDZPath;
+
+typedef struct
+{
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+} Q40PDZSeg;
+
+static uint16_t q40pdz_u16(hwaddr addr)
+{
+    uint16_t v = 0;
+    cpu_physical_memory_read(addr, &v, sizeof(v));
+    return v;
+}
+
+static uint32_t q40pdz_u32(hwaddr addr)
+{
+    uint32_t v = 0;
+    cpu_physical_memory_read(addr, &v, sizeof(v));
+    return v;
+}
+
+/* Canon asset colour is observed as RRGGBBAA.
+ * RGBA VRAM words are observed as AARRGGBB.
+ */
+static uint32_t q40pdz_colour(uint32_t v)
+{
+    uint32_t r = (v >> 24) & 0xFFU;
+    uint32_t g = (v >> 16) & 0xFFU;
+    uint32_t b = (v >>  8) & 0xFFU;
+    uint32_t a =  v        & 0xFFU;
+
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static int q40pdz_add_seg(
+    Q40PDZSeg *seg,
+    int *n,
+    float x0,
+    float y0,
+    float x1,
+    float y1)
+{
+    if (*n >= Q40PDZ_MAX_SEGS)
+        return 0;
+
+    seg[*n].x0 = x0;
+    seg[*n].y0 = y0;
+    seg[*n].x1 = x1;
+    seg[*n].y1 = y1;
+
+    (*n)++;
+    return 1;
+}
+
+static int q40pdz_build_path(
+    hwaddr a0,
+    hwaddr a1,
+    uint32_t tx,
+    uint32_t ty,
+    uint32_t canvas_w,
+    uint32_t canvas_h,
+    uint32_t out_w,
+    uint32_t out_h,
+    Q40PDZSeg *seg)
+{
+    uint16_t nb = q40pdz_u16(a0 + 4U);
+    uint16_t nc = q40pdz_u16(a1 + 4U);
+
+    uint8_t ops[Q40PDZ_MAX_OPS];
+    uint16_t coords[Q40PDZ_MAX_COORDS];
+
+    unsigned int oi;
+    unsigned int ci = 0;
+    int ns = 0;
+
+    float cur_x = 0;
+    float cur_y = 0;
+    float sub_x = 0;
+    float sub_y = 0;
+
+    int active = 0;
+
+    if (!canvas_w || !canvas_h ||
+        !out_w || !out_h ||
+        nb == 0 ||
+        nb > Q40PDZ_MAX_OPS ||
+        nc > Q40PDZ_MAX_COORDS)
+    {
+        return -1;
+    }
+
+    cpu_physical_memory_read(
+        a0 + 6U,
+        ops,
+        nb
+    );
+
+    cpu_physical_memory_read(
+        a1 + 6U,
+        coords,
+        (uint32_t)nc * 2U
+    );
+
+#define Q40PDZ_SX(x) \
+    ((float)((x) + tx) * (float)out_w / (float)canvas_w)
+
+#define Q40PDZ_SY(y) \
+    ((float)((y) + ty) * (float)out_h / (float)canvas_h)
+
+#define Q40PDZ_CLOSE()                                                   \
+    do {                                                                 \
+        if (active &&                                                    \
+            (cur_x != sub_x || cur_y != sub_y))                          \
+        {                                                                \
+            if (!q40pdz_add_seg(                                         \
+                    seg, &ns,                                            \
+                    Q40PDZ_SX(cur_x), Q40PDZ_SY(cur_y),                  \
+                    Q40PDZ_SX(sub_x), Q40PDZ_SY(sub_y)))                 \
+                return -1;                                               \
+        }                                                                \
+        active = 0;                                                      \
+    } while (0)
+
+    for (oi = 0; oi < nb; oi++)
+    {
+        uint8_t op = ops[oi];
+
+        if (op == 0x00)
+        {
+            Q40PDZ_CLOSE();
+        }
+        else if (op == 0x02)
+        {
+            if (ci + 2U > nc)
+                return -1;
+
+            if (active)
+                Q40PDZ_CLOSE();
+
+            cur_x = coords[ci++];
+            cur_y = coords[ci++];
+
+            sub_x = cur_x;
+            sub_y = cur_y;
+
+            active = 1;
+        }
+        else if (op == 0x04)
+        {
+            float nx;
+            float ny;
+
+            if (!active || ci + 2U > nc)
+                return -1;
+
+            nx = coords[ci++];
+            ny = coords[ci++];
+
+            if (!q40pdz_add_seg(
+                    seg, &ns,
+                    Q40PDZ_SX(cur_x), Q40PDZ_SY(cur_y),
+                    Q40PDZ_SX(nx), Q40PDZ_SY(ny)))
+                return -1;
+
+            cur_x = nx;
+            cur_y = ny;
+        }
+        else if (op == 0x06)
+        {
+            float nx;
+
+            if (!active || ci + 1U > nc)
+                return -1;
+
+            nx = coords[ci++];
+
+            if (!q40pdz_add_seg(
+                    seg, &ns,
+                    Q40PDZ_SX(cur_x), Q40PDZ_SY(cur_y),
+                    Q40PDZ_SX(nx), Q40PDZ_SY(cur_y)))
+                return -1;
+
+            cur_x = nx;
+        }
+        else if (op == 0x08)
+        {
+            float ny;
+
+            if (!active || ci + 1U > nc)
+                return -1;
+
+            ny = coords[ci++];
+
+            if (!q40pdz_add_seg(
+                    seg, &ns,
+                    Q40PDZ_SX(cur_x), Q40PDZ_SY(cur_y),
+                    Q40PDZ_SX(cur_x), Q40PDZ_SY(ny)))
+                return -1;
+
+            cur_y = ny;
+        }
+        else if (op == 0x0A)
+        {
+            float cx;
+            float cy;
+            float ex;
+            float ey;
+
+            float px;
+            float py;
+
+            unsigned int k;
+
+            if (!active || ci + 4U > nc)
+                return -1;
+
+            cx = coords[ci++];
+            cy = coords[ci++];
+            ex = coords[ci++];
+            ey = coords[ci++];
+
+            px = cur_x;
+            py = cur_y;
+
+            for (k = 1; k <= Q40PDZ_QSTEPS; k++)
+            {
+                float t =
+                    (float)k / (float)Q40PDZ_QSTEPS;
+
+                float it = 1.0f - t;
+
+                float nx =
+                    it * it * cur_x +
+                    2.0f * it * t * cx +
+                    t * t * ex;
+
+                float ny =
+                    it * it * cur_y +
+                    2.0f * it * t * cy +
+                    t * t * ey;
+
+                if (!q40pdz_add_seg(
+                        seg, &ns,
+                        Q40PDZ_SX(px), Q40PDZ_SY(py),
+                        Q40PDZ_SX(nx), Q40PDZ_SY(ny)))
+                    return -1;
+
+                px = nx;
+                py = ny;
+            }
+
+            cur_x = ex;
+            cur_y = ey;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+
+    if (active)
+        Q40PDZ_CLOSE();
+
+#undef Q40PDZ_CLOSE
+#undef Q40PDZ_SX
+#undef Q40PDZ_SY
+
+    if (ci != nc)
+        return -1;
+
+    return ns;
+}
+
+static int q40pdz_fill_path(
+    hwaddr target,
+    int dst_x,
+    int dst_y,
+    uint32_t out_w,
+    uint32_t out_h,
+    uint32_t clip_x,
+    uint32_t clip_y,
+    uint32_t clip_w,
+    uint32_t clip_h,
+    uint32_t colour,
+    Q40PDZSeg *seg,
+    int ns)
+{
+    uint32_t row[256];
+    float cross[Q40PDZ_MAX_SEGS];
+
+    unsigned int ly;
+    int spans = 0;
+
+    const int surface_w = 960;
+    const int surface_h = 540;
+
+    if (!out_w || !out_h ||
+        out_w > 256U ||
+        out_h > 256U ||
+        ns <= 0)
+    {
+        return 0;
+    }
+
+    for (ly = 0; ly < out_h; ly++)
+    {
+        float py = (float)ly + 0.5f;
+
+        int ncross = 0;
+        int i;
+
+        int ay = dst_y + (int)ly;
+
+        if (ay < (int)clip_y ||
+            ay >= (int)(clip_y + clip_h) ||
+            ay < 0 ||
+            ay >= surface_h)
+        {
+            continue;
+        }
+
+        for (i = 0; i < ns; i++)
+        {
+            float y0 = seg[i].y0;
+            float y1 = seg[i].y1;
+
+            if ((y0 <= py && y1 > py) ||
+                (y1 <= py && y0 > py))
+            {
+                float x =
+                    seg[i].x0 +
+                    (py - y0) *
+                    (seg[i].x1 - seg[i].x0) /
+                    (y1 - y0);
+
+                if (ncross < Q40PDZ_MAX_SEGS)
+                    cross[ncross++] = x;
+            }
+        }
+
+        for (i = 1; i < ncross; i++)
+        {
+            float v = cross[i];
+            int j = i - 1;
+
+            while (j >= 0 && cross[j] > v)
+            {
+                cross[j + 1] = cross[j];
+                j--;
+            }
+
+            cross[j + 1] = v;
+        }
+
+        for (i = 0; i + 1 < ncross; i += 2)
+        {
+            int lx0 = (int)(cross[i] + 0.5f);
+            int lx1 = (int)(cross[i + 1] + 0.5f);
+
+            int ax0;
+            int ax1;
+
+            int k;
+            int count;
+
+            if (lx0 < 0)
+                lx0 = 0;
+
+            if (lx1 > (int)out_w)
+                lx1 = out_w;
+
+            if (lx1 <= lx0)
+                continue;
+
+            ax0 = dst_x + lx0;
+            ax1 = dst_x + lx1;
+
+            if (ax0 < (int)clip_x)
+                ax0 = clip_x;
+
+            if (ax1 > (int)(clip_x + clip_w))
+                ax1 = clip_x + clip_w;
+
+            if (ax0 < 0)
+                ax0 = 0;
+
+            if (ax1 > surface_w)
+                ax1 = surface_w;
+
+            if (ax1 <= ax0)
+                continue;
+
+            count = ax1 - ax0;
+
+            for (k = 0; k < count; k++)
+                row[k] = colour;
+
+            cpu_physical_memory_write(
+                target +
+                    (
+                        (
+                            (uint64_t)ay * surface_w +
+                            (uint32_t)ax0
+                        ) * 4U
+                    ),
+                row,
+                count * sizeof(uint32_t)
+            );
+
+            spans++;
+        }
+    }
+
+    return spans;
+}
+
+static int q40pdz_render_7b(
+    hwaddr record_ptr,
+    hwaddr target)
+{
+    uint32_t r[48];
+
+    hwaddr asset;
+
+    uint32_t total;
+    uint32_t kind;
+
+    uint32_t off1112 = 0;
+    uint32_t offbbb0 = 0;
+    uint32_t offcc10 = 0;
+    uint32_t off2220 = 0;
+
+    uint32_t colours[Q40PDZ_MAX_COLORS];
+    int ncolours = 0;
+
+    Q40PDZPath paths[Q40PDZ_MAX_PATHS];
+    int npaths = 0;
+
+    uint32_t canvas_w;
+    uint32_t canvas_h;
+
+    uint32_t req_w;
+    uint32_t req_h;
+
+    uint32_t clip_x;
+    uint32_t clip_y;
+    uint32_t clip_w;
+    uint32_t clip_h;
+
+    union { uint32_t u; float f; } fx;
+    union { uint32_t u; float f; } fy;
+
+    int dst_x;
+    int dst_y;
+
+    uint32_t p;
+    int group = 0;
+    int paths_rendered = 0;
+    int spans = 0;
+
+    cpu_physical_memory_read(
+        record_ptr,
+        r,
+        sizeof(r)
+    );
+
+    /*
+     * Restrict this experiment to the exact 5D4 schema observed
+     * in all 43 PDP records.
+     */
+    if (target != 0x03911D00U ||
+        r[0] != 0x02010101U ||
+        r[1] != 0x00640200U ||
+        r[2] != 0x00000044U ||
+        r[10] != 0x000000C0U)
+    {
+        return 0;
+    }
+
+    asset = r[4];
+
+    if (asset < 0xFC000000U ||
+        asset >= 0xFE000000U)
+    {
+        return 0;
+    }
+
+    req_w = r[21] & 0xFFFFU;
+    req_h = r[21] >> 16;
+
+    if (!req_w || !req_h ||
+        req_w > 256U ||
+        req_h > 256U)
+    {
+        return 0;
+    }
+
+    clip_x = r[39];
+    clip_y = r[40];
+    clip_w = r[41];
+    clip_h = r[42];
+
+    if (!clip_w || !clip_h)
+        return 0;
+
+    fx.u = r[19];
+    fy.u = r[20];
+
+    if (!(fx.f > -4096.0f && fx.f < 4096.0f) ||
+        !(fy.f > -4096.0f && fy.f < 4096.0f))
+    {
+        return 0;
+    }
+
+    dst_x = (int)(fx.f + 0.5f);
+    dst_y = (int)(fy.f + 0.5f);
+
+    if (q40pdz_u16(asset + 0U) != 0x9999U ||
+        q40pdz_u16(asset + 2U) != 0x000CU)
+    {
+        return 0;
+    }
+
+    total = q40pdz_u32(asset + 4U);
+    kind = q40pdz_u32(asset + 8U);
+
+    if (kind != 6U ||
+        total < 12U ||
+        total > 0x10000U)
+    {
+        return 0;
+    }
+
+    /*
+     * Top-level TLV scan.
+     */
+    p = 0;
+
+    while (p < total)
+    {
+        uint16_t tag;
+        uint16_t sz;
+
+        if (p + 4U > total)
+            return 0;
+
+        tag = q40pdz_u16(asset + p);
+        sz  = q40pdz_u16(asset + p + 2U);
+
+        if (sz < 4U || p + sz > total)
+            return 0;
+
+        if (tag == 0x1112U)
+            off1112 = p;
+        else if (tag == 0xBBB0U)
+            offbbb0 = p;
+        else if (tag == 0xCC10U)
+            offcc10 = p;
+        else if (tag == 0x2220U)
+            off2220 = p;
+
+        p += sz;
+    }
+
+    if (p != total ||
+        !off1112 ||
+        !offbbb0 ||
+        !offcc10 ||
+        !off2220)
+    {
+        return 0;
+    }
+
+    canvas_w =
+        q40pdz_u32(asset + off1112 + 0x18U) >> 16;
+
+    canvas_h =
+        q40pdz_u32(asset + off1112 + 0x1CU) >> 16;
+
+    if (!canvas_w || !canvas_h)
+        return 0;
+
+    /*
+     * BBB1 colours, in the same order as the 2222 groups.
+     */
+    {
+        uint32_t end =
+            offbbb0 +
+            q40pdz_u16(asset + offbbb0 + 2U);
+
+        uint32_t q = offbbb0 + 4U;
+
+        while (q + 8U <= end)
+        {
+            if (q40pdz_u16(asset + q) == 0xBBB1U &&
+                q40pdz_u16(asset + q + 2U) == 8U)
+            {
+                if (ncolours < Q40PDZ_MAX_COLORS)
+                {
+                    colours[ncolours++] =
+                        q40pdz_u32(asset + q + 4U);
+                }
+
+                q += 8U;
+            }
+            else
+            {
+                q += 4U;
+            }
+        }
+    }
+
+    if (!ncolours)
+        return 0;
+
+    /*
+     * Find the exact alternating AAA0 / AAA1 stream consuming
+     * the remainder of CC10.
+     */
+    {
+        uint32_t cc_end =
+            offcc10 +
+            q40pdz_u16(asset + offcc10 + 2U);
+
+        uint32_t start;
+
+        int found = 0;
+
+        for (start = offcc10 + 4U;
+             start + 4U <= cc_end;
+             start += 4U)
+        {
+            uint32_t q = start;
+            uint16_t want = 0xAAA0U;
+            hwaddr pending_a0 = 0;
+
+            int np = 0;
+            int valid = 1;
+
+            while (q < cc_end)
+            {
+                uint16_t tag;
+                uint16_t sz;
+
+                if (q + 4U > cc_end)
+                {
+                    valid = 0;
+                    break;
+                }
+
+                tag = q40pdz_u16(asset + q);
+                sz  = q40pdz_u16(asset + q + 2U);
+
+                if (tag != want ||
+                    sz < 4U ||
+                    q + sz > cc_end)
+                {
+                    valid = 0;
+                    break;
+                }
+
+                if (want == 0xAAA0U)
+                {
+                    pending_a0 = asset + q;
+                    want = 0xAAA1U;
+                }
+                else
+                {
+                    if (np >= Q40PDZ_MAX_PATHS)
+                    {
+                        valid = 0;
+                        break;
+                    }
+
+                    paths[np].a0 = pending_a0;
+                    paths[np].a1 = asset + q;
+
+                    np++;
+                    want = 0xAAA0U;
+                }
+
+                q += sz;
+            }
+
+            if (valid &&
+                q == cc_end &&
+                want == 0xAAA0U &&
+                np > 0)
+            {
+                npaths = np;
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found)
+            return 0;
+    }
+
+    /*
+     * Walk groups following 2220.
+     */
+    p =
+        off2220 +
+        q40pdz_u16(asset + off2220 + 2U);
+
+    while (p < total)
+    {
+        uint16_t tag = q40pdz_u16(asset + p);
+        uint16_t gsz = q40pdz_u16(asset + p + 2U);
+
+        uint32_t tx = 0;
+        uint32_t ty = 0;
+        uint32_t colour;
+
+        if (tag == 0xFFFFU)
+            break;
+
+        if (tag != 0x2222U ||
+            (gsz != 0x000CU && gsz != 0x0010U))
+        {
+            return 0;
+        }
+
+        if (gsz == 0x0010U)
+        {
+            uint32_t w3 =
+                q40pdz_u32(asset + p + 12U);
+
+            tx = w3 & 0xFFFFU;
+            ty = w3 >> 16;
+        }
+
+        if (group < ncolours)
+            colour = q40pdz_colour(colours[group]);
+        else
+            colour = 0xFFFFFFFFU;
+
+        p += gsz;
+
+        while (p < total &&
+               q40pdz_u16(asset + p) == 0xAAACU)
+        {
+            uint16_t asz =
+                q40pdz_u16(asset + p + 2U);
+
+            uint32_t ref;
+
+            Q40PDZSeg seg[Q40PDZ_MAX_SEGS];
+            int ns;
+
+            if (asz != 0x000CU)
+                return 0;
+
+            ref = q40pdz_u32(asset + p + 8U);
+
+            if (ref == 0U ||
+                ref > (uint32_t)npaths)
+            {
+                return 0;
+            }
+
+            ns = q40pdz_build_path(
+                paths[ref - 1U].a0,
+                paths[ref - 1U].a1,
+                tx,
+                ty,
+                canvas_w,
+                canvas_h,
+                req_w,
+                req_h,
+                seg
+            );
+
+            if (ns < 0)
+                return 0;
+
+            spans += q40pdz_fill_path(
+                target,
+                dst_x,
+                dst_y,
+                req_w,
+                req_h,
+                clip_x,
+                clip_y,
+                clip_w,
+                clip_h,
+                colour,
+                seg,
+                ns
+            );
+
+            paths_rendered++;
+            p += asz;
+        }
+
+        if (p >= total ||
+            q40pdz_u16(asset + p) != 0xEEEEU ||
+            q40pdz_u16(asset + p + 2U) != 4U)
+        {
+            return 0;
+        }
+
+        p += 4U;
+        group++;
+    }
+
+    fprintf(
+        stderr,
+        "[QEMU40PDZ-ZICO7B] "
+        "asset=%08x dst=%d,%d req=%ux%u "
+        "canvas=%ux%u groups=%d paths=%d spans=%d\n",
+        (uint32_t)asset,
+        dst_x,
+        dst_y,
+        req_w,
+        req_h,
+        canvas_w,
+        canvas_h,
+        group,
+        paths_rendered,
+        spans
+    );
+
+    return paths_rendered > 0;
+}
+
 unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned char type, unsigned int value)
 {
+    /*
+     * QEMU40IZ — 5D4 APROC diagnostic readback.
+     *
+     * Canon FW 1.3.3 polls:
+     *   D80003F4 == 0x52315231
+     *   D80003F8 == 0x52325232
+     *
+     * QEMU previously returned zero for both, causing 100000 retries.
+     *
+     * Diagnostic only: do not synthesize IRQs/callbacks here.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        type == 0x10)
+    {
+        if (address == 0xD80003F4)
+        {
+            fprintf(stderr,
+                    "[QEMU40IZ-APROC] R D80003F4 -> 52315231\n");
+            return 0x52315231;
+        }
+
+        if (address == 0xD80003F8)
+        {
+            fprintf(stderr,
+                    "[QEMU40IZ-APROC] R D80003F8 -> 52325232\n");
+            return 0x52325232;
+        }
+    }
+
     const char *msg = NULL;
     unsigned int ret = 0;
     
     static uint32_t palette_addr = 0;
+
+    /*
+     * QEMU40PAD-AU-ZICO
+     *
+     * Minimal 5D4 Zico IRQ 0x19A pending state.
+     *
+     * Canon FE213AB2 reads D20F0818 as an 8-bit callback
+     * pending mask and acknowledges pending bits by writing
+     * the same mask to D20F0814.
+     */
+    static uint32_t q40pad_au_zico_irq19a_pending = 0;
+
+    /*
+     * QEMU40PAD-BB-MZRM
+     *
+     * Deferred MZRM/Zico completion state.
+     * BA proved the missing consumer causally, but advanced read_idx
+     * synchronously at the D20F0840 doorbell.
+     *
+     * BB instead records the producer index here and advances the
+     * consumer only when Canon services IRQ19A via D20F0818.
+     */
+    static uint32_t q40pad_bb_mzrm_consume_armed = 0;
+    static uint32_t q40pad_bb_mzrm_target_idx = 0;
+
+    /*
+     * QEMU40HN-RTC-FRAME
+     * Diagnostic 5D4 RTC device response.
+     *
+     * Canon FE1FBE4A requests an 18-byte RTC frame.
+     * FE1FBC5E/FE1FBBCE prove that calendar fields are packed BCD.
+     *
+     * Synthetic time:
+     *   2024-01-01 12:34:20
+     *
+     * Logical frame:
+     *   20 34 12 02 01 01 24 00
+     *   00 00 00 00 00 00 00 00
+     *   20 00
+     *
+     * FE4C80AC reads bytes reversed inside each 32-bit word,
+     * hence the D98401C0 window below uses bus ordering.
+     */
+    static uint32_t q40hn_rtc_cfg = 0;
+    static unsigned int q40hn_rtc_frame_active = 0;
+    static unsigned int q40hn_rtc_frame_reads = 0;
+
+    /* QEMU40HI-D984-COMPLETION: diagnostic 5D4 RTC controller state. */
+    static uint32_t q40hi_d9840a08 = 0;
+    static unsigned int q40hi_irq_count = 0;
+    static int q40hi_status_read_logged = 0;
+
+    /*
+     * QEMU40HD-RTCMMIO
+     * Passive trace only; no MMIO behaviour is modified.
+     * Canon 5D4 FW 1.3.3 RTC-related DIGIC6 windows.
+     */
+    int q40hd_rtc_mmio =
+        ((address >= 0xD9840000U && address <= 0xD9840FFFU) ||
+         (address >= 0xD9860000U && address <= 0xD9860FFFU) ||
+         address == 0xD20B0314U ||
+         address == 0xD20B2318U);
+
     
     /* 0xD20B0A24/C34/994/224, depending on model */
     if (address == eos_state->model->card_led_address)
@@ -6770,6 +10557,20 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
         return eos_handle_imgpowdet(parm, address, type, value);
     }
 
+    /*
+     * QEMU40PBM — 5D4 HDMI physical detect.
+     *
+     * FW 1.3.3 FE34D198 tests bit16 of D20B22DC.
+     * bit16=0 is debounced by HotPlug as HDMI connected.
+     * Model the normal no-cable state with bit16=1.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+        !(type & MODE_WRITE) &&
+        address == 0xD20B22DCU)
+    {
+        return 0x00010000U;
+    }
+
     switch (address)
     {
         case 0xD20B071C:
@@ -6783,6 +10584,1278 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
         case 0xD203086C:
             msg = "7D2 init";
             ret = 1;
+            break;
+
+        /*
+         * QEMU38ZZQ experimental 5D4 MOCom/Omar completion.
+         *
+         * 5D4 FW 1.3.3 registers Omar's state-2 callback on
+         * MOCom channel 1, mapped to IRQ 0x9C.
+         *
+         * The state-2 path then writes value 3 to D20F0110.
+         * Test whether that write represents the missing hardware
+         * completion source.
+         *
+         * QEMU-only diagnostic; not yet a complete MOCom model.
+         */
+        case 0xD20F0110:
+            if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+                (type & MODE_WRITE) &&
+                value == 3)
+            {
+                static unsigned int q38zzq_count = 0;
+                q38zzq_count++;
+
+                msg = "5D4 MOCom/Omar completion";
+
+                fprintf(stderr,
+                        "[QEMU38ZZQ-MOCOM] D20F0110=3 -> IRQ 0x9C (#%u)\\n",
+                        q38zzq_count);
+
+                /*
+                 * Keep this asynchronous: the physical operation
+                 * completes after the command write.
+                 */
+                eos_trigger_int(0x9C, 1);
+            }
+            break;
+
+        /*
+         * QEMU40PAD-AU-ZICO
+         *
+         * Canon EOS 5D Mark IV FW 1.3.3 Zico IRQ model.
+         *
+         * Proven from FE213AB2:
+         *
+         *   D20F0818 = pending callback mask
+         *   D20F0814 = acknowledge register
+         *
+         * The IRQ handler tests bits 0..7 and dispatches the
+         * corresponding callback table entry.
+         *
+         * FE13626C, which signals EveZicoWai bit 1, is registered
+         * in callback slot 2; therefore its hardware pending bit
+         * is 1 << 2 = 0x4.
+         *
+         * Diagnostic causal model:
+         *
+         *   D20F0120 = 3
+         *       -> pending |= 0x4
+         *       -> IRQ 0x19A
+         *
+         * Canon itself performs the callback dispatch and EventFlag
+         * signal. No Canon RAM/state or EveZicoWai is patched here.
+         */
+        case 0xD20F0120:
+            if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+                (type & MODE_WRITE) &&
+                value == 3)
+            {
+                q40pad_au_zico_irq19a_pending |= 0x00000004U;
+
+                msg = "5D4 Zico/MZRM completion pending";
+
+                fprintf(stderr,
+                        "[QEMU40PAD-AU-ZICO] "
+                        "D20F0120=3 -> pending=%08x -> IRQ 0x19A\n",
+                        q40pad_au_zico_irq19a_pending);
+
+                eos_trigger_int(0x19A, 1);
+            }
+            break;
+
+        /*
+         * Zico IRQ 0x19A pending callback bits.
+         *
+         * FE213AB2:
+         *
+         *   base literal = D20F0808
+         *   base + 0x10  = D20F0818 pending
+         */
+        /*
+         * QEMU40PAD-BB-MZRM
+         *
+         * Marius -> Zico MZRM doorbell.
+         *
+         * BA established:
+         *   service            = 0xBFF00400
+         *   producer/write idx = service + 0x10
+         *   consumer/read idx  = service + 0x28
+         *   completion result  = service + 0x2C
+         *   D20F0840 bit 2     = MZRM/Zico doorbell
+         *
+         * BA synchronously copied write_idx -> read_idx here.
+         * That was sufficient to complete Startup, but Canon then
+         * skipped FE136250/EveZicoWai because the indices were already
+         * equal before the completion IRQ arrived.
+         *
+         * BB defers the consumer advance until IRQ19A is actually
+         * serviced through D20F0818.
+         */
+        case 0xD20F0840:
+            if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+                (type & MODE_WRITE) &&
+                (value & 0x00000004U))
+            {
+                uint32_t write_idx = 0;
+                uint32_t read_idx = 0;
+                uint32_t result = 0;
+
+                /*
+                 * QEMU40PAD-BC-R20BE-MZRM-CMD
+                 *
+                 * Passive diagnostic only.
+                 *
+                 * FE42305C establishes:
+                 *   manager + 0x10 = producer index
+                 *   manager + 0x18 = ring pointer array
+                 *
+                 * The active 5D4 Mzrm manager is BFF00400.
+                 * At the Zico doorbell, inspect the newly produced
+                 * command before the existing synthetic completion.
+                 */
+                uint32_t ring_ptr = 0;
+                uint32_t cmd_ptr = 0;
+                uint32_t cmd_words[24] = { 0 };
+                unsigned int cmd_i;
+
+                cpu_physical_memory_read(
+                    0xBFF00410,
+                    &write_idx,
+                    sizeof(write_idx)
+                );
+
+                cpu_physical_memory_read(
+                    0xBFF00428,
+                    &read_idx,
+                    sizeof(read_idx)
+                );
+
+                cpu_physical_memory_read(
+                    0xBFF0042C,
+                    &result,
+                    sizeof(result)
+                );
+
+                cpu_physical_memory_read(
+                    0xBFF00418,
+                    &ring_ptr,
+                    sizeof(ring_ptr)
+                );
+
+                if (ring_ptr)
+                {
+                    uint32_t slot_addr =
+                        ring_ptr + ((write_idx & 0x1FU) * 4U);
+
+                    cpu_physical_memory_read(
+                        slot_addr,
+                        &cmd_ptr,
+                        sizeof(cmd_ptr)
+                    );
+                }
+
+                if (cmd_ptr)
+                {
+                    cpu_physical_memory_read(
+                        cmd_ptr,
+                        cmd_words,
+                        sizeof(cmd_words)
+                    );
+                }
+
+                /*
+                 * QEMU40PDP-7B-PAYLOAD
+                 *
+                 * Passive inspection only.
+                 *
+                 * PDO observed command 0x7B carrying:
+                 *   cmd_words[4] = pointer
+                 *   cmd_words[6] = 0xC0
+                 *
+                 * The pointer advances by exactly 0xC0 for every
+                 * observed GUI operation.
+                 *
+                 * Read the complete pointed record without changing
+                 * guest memory or completion behaviour.
+                 */
+                if (cmd_ptr &&
+                    cmd_words[0] == 0x0000007BU &&
+                    cmd_words[4] != 0 &&
+                    cmd_words[6] == 0x000000C0U)
+                {
+                    static unsigned int q40pdp_seq = 0;
+                    static uint32_t q40pdp_prev = 0;
+
+                    uint32_t q40pdp_ptr = cmd_words[4];
+                    uint32_t q40pdp_words[48] = { 0 };
+                    unsigned int q40pdp_i;
+                    int32_t q40pdp_delta =
+                        q40pdp_prev
+                        ? (int32_t)(q40pdp_ptr - q40pdp_prev)
+                        : 0;
+
+                    q40pdp_seq++;
+
+                    cpu_physical_memory_read(
+                        q40pdp_ptr,
+                        q40pdp_words,
+                        sizeof(q40pdp_words)
+                    );
+
+                    fprintf(stderr,
+                            "[QEMU40PDP-7B-PAYLOAD] "
+                            "SEQ=%u PTR=%08x SIZE=%u "
+                            "DELTA=%d TARGET=%08x\n",
+                            q40pdp_seq,
+                            q40pdp_ptr,
+                            cmd_words[6],
+                            q40pdp_delta,
+                            cmd_words[8]);
+
+                    for (q40pdp_i = 0;
+                         q40pdp_i < 48;
+                         q40pdp_i += 8)
+                    {
+                        fprintf(stderr,
+                                "[QEMU40PDP-7B-PAYLOAD] "
+                                "SEQ=%u P+%02x "
+                                "%08x %08x %08x %08x "
+                                "%08x %08x %08x %08x\n",
+                                q40pdp_seq,
+                                q40pdp_i * 4,
+                                q40pdp_words[q40pdp_i + 0],
+                                q40pdp_words[q40pdp_i + 1],
+                                q40pdp_words[q40pdp_i + 2],
+                                q40pdp_words[q40pdp_i + 3],
+                                q40pdp_words[q40pdp_i + 4],
+                                q40pdp_words[q40pdp_i + 5],
+                                q40pdp_words[q40pdp_i + 6],
+                                q40pdp_words[q40pdp_i + 7]);
+                    }
+
+                    q40pdp_prev = q40pdp_ptr;
+                }
+
+                /*
+                 * QEMU40PDZ-ZICO7B
+                 *
+                 * Execute the decoded vector bitmap primitive before
+                 * the existing synthetic MZRM completion is armed.
+                 *
+                 * Completion/consumer/IRQ behaviour is untouched.
+                 */
+                if (cmd_ptr &&
+                    cmd_words[0] == 0x0000007BU &&
+                    cmd_words[4] != 0 &&
+                    cmd_words[6] == 0x000000C0U &&
+                    cmd_words[8] == 0x03911D00U)
+                {
+                    q40pdz_render_7b(
+                        cmd_words[4],
+                        cmd_words[8]
+                    );
+                }
+
+                fprintf(stderr,
+                        "[QEMU40PAD-BC-R20BE-MZRM-CMD] "
+                        "write=%08x read=%08x "
+                        "ring=%08x cmd=%08x result=%08x\\n",
+                        write_idx,
+                        read_idx,
+                        ring_ptr,
+                        cmd_ptr,
+                        result);
+
+                if (cmd_ptr)
+                {
+                    for (cmd_i = 0; cmd_i < 24; cmd_i += 4)
+                    {
+                        fprintf(stderr,
+                                "[QEMU40PAD-BC-R20BE-MZRM-CMD] "
+                                "CMD+%02x "
+                                "%08x %08x %08x %08x\\n",
+                                cmd_i * 4,
+                                cmd_words[cmd_i + 0],
+                                cmd_words[cmd_i + 1],
+                                cmd_words[cmd_i + 2],
+                                cmd_words[cmd_i + 3]);
+                    }
+
+                    for (cmd_i = 0; cmd_i < 24; cmd_i++)
+                    {
+                        if (cmd_words[cmd_i] == 0x000000DFU ||
+                            cmd_words[cmd_i] == 0x000000E0U ||
+                            cmd_words[cmd_i] == 0x03B0C100U ||
+                            cmd_words[cmd_i] == 0x03911D00U)
+                        {
+                            fprintf(stderr,
+                                    "[QEMU40PAD-BC-R20BE-MZRM-CMD] "
+                                    "KNOWN[%02u]=%08x\\n",
+                                    cmd_i,
+                                    cmd_words[cmd_i]);
+                        }
+                    }
+                }
+
+                /*
+                 * QEMU40PAD-BC-R20BG-DF-WITNESS
+                 *
+                 * Diagnostic 0xDF executor only.
+                 *
+                 * R20BF establishes:
+                 *
+                 *   W5  = x
+                 *   W6  = y
+                 *   W7  = width
+                 *   W8  = height
+                 *   W9 low byte = colour/index
+                 *
+                 *   W10..W13 = clipping rectangle
+                 *
+                 *   W14 = 'VRAM'
+                 *   W15 = backing address
+                 *   W17 = pixel format
+                 *   W18 = surface width
+                 *   W19 = surface height
+                 *
+                 * This witness deliberately DOES NOT claim correct
+                 * Canon/Zico palette semantics.
+                 *
+                 * The 8-bit colour index is expanded to opaque
+                 * grayscale solely to prove the missing execution path.
+                 */
+                if (cmd_ptr &&
+                    cmd_words[0] == 0x000000DFU &&
+                    cmd_words[14] == 0x5652414DU &&
+                    cmd_words[15] == 0x03911D00U &&
+                    cmd_words[17] == 0x05040100U &&
+                    cmd_words[18] == 960U &&
+                    cmd_words[19] == 540U)
+                {
+                    static uint64_t bg_df_commands = 0;
+                    static uint64_t bg_df_pixels = 0;
+
+                    uint32_t rx = cmd_words[5];
+                    uint32_t ry = cmd_words[6];
+                    uint32_t rw = cmd_words[7];
+                    uint32_t rh = cmd_words[8];
+
+                    uint32_t colour_index =
+                        cmd_words[9] & 0xFFU;
+
+                    uint32_t cx = cmd_words[10];
+                    uint32_t cy = cmd_words[11];
+                    uint32_t cw = cmd_words[12];
+                    uint32_t ch = cmd_words[13];
+
+                    uint32_t sw = cmd_words[18];
+                    uint32_t sh = cmd_words[19];
+                    uint32_t dst = cmd_words[15];
+
+                    uint64_t rx1 = (uint64_t)rx + rw;
+                    uint64_t ry1 = (uint64_t)ry + rh;
+                    uint64_t cx1 = (uint64_t)cx + cw;
+                    uint64_t cy1 = (uint64_t)cy + ch;
+
+                    uint32_t x0 = rx > cx ? rx : cx;
+                    uint32_t y0 = ry > cy ? ry : cy;
+
+                    uint64_t x1_64 =
+                        rx1 < cx1 ? rx1 : cx1;
+
+                    uint64_t y1_64 =
+                        ry1 < cy1 ? ry1 : cy1;
+
+                    if (x1_64 > sw)
+                        x1_64 = sw;
+
+                    if (y1_64 > sh)
+                        y1_64 = sh;
+
+                    if (x0 < sw &&
+                        y0 < sh &&
+                        x1_64 > x0 &&
+                        y1_64 > y0)
+                    {
+                        uint32_t x1 = (uint32_t)x1_64;
+                        uint32_t y1 = (uint32_t)y1_64;
+
+                        uint32_t count = x1 - x0;
+                        uint32_t pixel =
+                            0xFF000000U |
+                            (colour_index * 0x00010101U);
+
+                        uint32_t row[960];
+                        uint32_t px;
+                        uint32_t yy;
+                        uint32_t verify = 0;
+
+                        for (px = 0; px < count; px++)
+                            row[px] = pixel;
+
+                        for (yy = y0; yy < y1; yy++)
+                        {
+                            uint64_t offset =
+                                (((uint64_t)yy * sw) + x0) * 4U;
+
+                            cpu_physical_memory_write(
+                                (hwaddr)((uint64_t)dst + offset),
+                                row,
+                                count * sizeof(uint32_t)
+                            );
+                        }
+
+                        cpu_physical_memory_read(
+                            (hwaddr)(
+                                (uint64_t)dst +
+                                ((((uint64_t)y0 * sw) + x0) * 4U)
+                            ),
+                            &verify,
+                            sizeof(verify)
+                        );
+
+                        bg_df_commands++;
+                        bg_df_pixels +=
+                            (uint64_t)count * (y1 - y0);
+
+                        fprintf(
+                            stderr,
+                            "[QEMU40PAD-BC-R20BG-DF-WITNESS] "
+                            "#%llu "
+                            "rect=%u,%u %ux%u "
+                            "clip=%u,%u %ux%u "
+                            "effective=%u,%u..%u,%u "
+                            "idx=%u pixel=%08x "
+                            "verify=%08x "
+                            "total_pixels=%llu\n",
+                            (unsigned long long)bg_df_commands,
+                            rx, ry, rw, rh,
+                            cx, cy, cw, ch,
+                            x0, y0, x1, y1,
+                            colour_index,
+                            pixel,
+                            verify,
+                            (unsigned long long)bg_df_pixels
+                        );
+                    }
+                    else
+                    {
+                        fprintf(
+                            stderr,
+                            "[QEMU40PAD-BC-R20BG-DF-WITNESS] "
+                            "CLIPPED_EMPTY "
+                            "rect=%u,%u %ux%u "
+                            "clip=%u,%u %ux%u\n",
+                            rx, ry, rw, rh,
+                            cx, cy, cw, ch
+                        );
+                    }
+                }
+
+                /*
+                 * QEMU40PAD-BC-R20BI-XIMR24-WITNESS
+                 *
+                 * Diagnostic XIMR/Zico compositor witness only.
+                 *
+                 * R20BH proved that opcode 0x24 carries an exact
+                 * 1080-byte copy of the live XIMR context.
+                 *
+                 * This witness handles ONLY the observed single
+                 * enabled layer and performs a raw 32-bit crop/copy.
+                 *
+                 * It deliberately does NOT emulate:
+                 *   - pixel-format conversion
+                 *   - alpha/blending
+                 *   - scaling
+                 *   - multiple layers
+                 *   - real Zico/XIMR semantics
+                 */
+                if (cmd_ptr &&
+                    cmd_words[0] == 0x00000024U &&
+                    cmd_words[1] == 0x00000013U &&
+                    cmd_words[2] == 0x0000043CU &&
+                    cmd_words[3] != 0)
+                {
+                    static uint64_t bi_ximr_jobs = 0;
+                    static uint64_t bi_pixels = 0;
+
+                    uint32_t payload = cmd_words[3];
+
+                    uint32_t xoc_sig = 0;
+                    uint32_t xoc_bitmap = 0;
+                    uint32_t xoc_flags = 0;
+                    uint32_t xoc_w = 0;
+                    uint32_t xoc_h = 0;
+
+                    uint8_t l0_enable = 0;
+
+                    uint32_t src_x = 0;
+                    uint32_t src_y = 0;
+                    uint32_t rect_h = 0;
+                    uint32_t rect_w = 0;
+
+                    uint16_t dst_y = 0;
+                    uint16_t dst_x = 0;
+
+                    uint32_t src_sig = 0;
+                    uint32_t src_bitmap = 0;
+                    uint32_t src_flags = 0;
+                    uint32_t src_w = 0;
+                    uint32_t src_h = 0;
+
+                    cpu_physical_memory_read(
+                        payload + 0x2C,
+                        &xoc_sig,
+                        sizeof(xoc_sig)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x30,
+                        &xoc_bitmap,
+                        sizeof(xoc_bitmap)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x38,
+                        &xoc_flags,
+                        sizeof(xoc_flags)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x3C,
+                        &xoc_w,
+                        sizeof(xoc_w)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x40,
+                        &xoc_h,
+                        sizeof(xoc_h)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x7A,
+                        &l0_enable,
+                        sizeof(l0_enable)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x80,
+                        &src_x,
+                        sizeof(src_x)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x84,
+                        &src_y,
+                        sizeof(src_y)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x88,
+                        &rect_h,
+                        sizeof(rect_h)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x8C,
+                        &rect_w,
+                        sizeof(rect_w)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x90,
+                        &dst_y,
+                        sizeof(dst_y)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x92,
+                        &dst_x,
+                        sizeof(dst_x)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x98,
+                        &src_sig,
+                        sizeof(src_sig)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0x9C,
+                        &src_bitmap,
+                        sizeof(src_bitmap)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0xA4,
+                        &src_flags,
+                        sizeof(src_flags)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0xA8,
+                        &src_w,
+                        sizeof(src_w)
+                    );
+
+                    cpu_physical_memory_read(
+                        payload + 0xAC,
+                        &src_h,
+                        sizeof(src_h)
+                    );
+
+                    fprintf(
+                        stderr,
+                        "[QEMU40PAD-BC-R20BI-XIMR24-WITNESS] "
+                        "job payload=%08x "
+                        "enable=%u "
+                        "src=%08x %ux%u flags=%08x "
+                        "rect=%u,%u %ux%u "
+                        "dst=%u,%u "
+                        "xoc=%08x %ux%u flags=%08x\n",
+                        payload,
+                        l0_enable,
+                        src_bitmap,
+                        src_w,
+                        src_h,
+                        src_flags,
+                        src_x,
+                        src_y,
+                        rect_w,
+                        rect_h,
+                        dst_x,
+                        dst_y,
+                        xoc_bitmap,
+                        xoc_w,
+                        xoc_h,
+                        xoc_flags
+                    );
+
+                    /*
+                     * QEMU40PDL-XIMR-LAYERS
+                     *
+                     * Passive enumeration of all eight natural XIMR
+                     * layer slots.
+                     *
+                     * Canon setters prove:
+                     *   per-layer stride = 0x48
+                     *   enable           = +0x7A
+                     *   source rect      = +0x80..+0x8C
+                     *   destination      = +0x90/+0x92
+                     *   MARV copy        = +0x98
+                     *
+                     * No guest state is modified.
+                     */
+                    {
+                        unsigned int li;
+                        unsigned int enabled_count = 0;
+
+                        fprintf(stderr,
+                                "[QEMU40PDL-XIMR-LAYERS] "
+                                "BEGIN payload=%08x "
+                                "xoc=%08x flags=%08x %ux%u\n",
+                                payload,
+                                xoc_bitmap,
+                                xoc_flags,
+                                xoc_w,
+                                xoc_h);
+
+                        for (li = 0; li < 8; li++)
+                        {
+                            uint32_t lo = li * 0x48U;
+
+                            uint8_t enable = 0;
+                            uint8_t mode = 0;
+
+                            uint32_t sx = 0;
+                            uint32_t sy = 0;
+                            uint32_t rh = 0;
+                            uint32_t rw = 0;
+
+                            uint16_t dy = 0;
+                            uint16_t dx = 0;
+
+                            uint32_t sig = 0;
+                            uint32_t bitmap = 0;
+                            uint32_t opacity = 0;
+                            uint32_t flags = 0;
+                            uint32_t w = 0;
+                            uint32_t h = 0;
+                            uint32_t pmem = 0;
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x79U,
+                                &mode, 1);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x7AU,
+                                &enable, 1);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x80U,
+                                &sx, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x84U,
+                                &sy, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x88U,
+                                &rh, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x8CU,
+                                &rw, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x90U,
+                                &dy, 2);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x92U,
+                                &dx, 2);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x98U,
+                                &sig, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0x9CU,
+                                &bitmap, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0xA0U,
+                                &opacity, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0xA4U,
+                                &flags, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0xA8U,
+                                &w, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0xACU,
+                                &h, 4);
+
+                            cpu_physical_memory_read(
+                                payload + lo + 0xB0U,
+                                &pmem, 4);
+
+                            if (enable)
+                                enabled_count++;
+
+                            fprintf(stderr,
+                                    "[QEMU40PDL-XIMR-LAYER] "
+                                    "L=%u EN=%u MODE=%u "
+                                    "SIG=%08x BMP=%08x OP=%08x "
+                                    "FLAGS=%08x WH=%ux%u "
+                                    "SRC=%u,%u RECT=%ux%u "
+                                    "DST=%u,%u PMEM=%08x\n",
+                                    li,
+                                    enable,
+                                    mode,
+                                    sig,
+                                    bitmap,
+                                    opacity,
+                                    flags,
+                                    w,
+                                    h,
+                                    sx,
+                                    sy,
+                                    rw,
+                                    rh,
+                                    dx,
+                                    dy,
+                                    pmem);
+                        }
+
+                        fprintf(stderr,
+                                "[QEMU40PDL-XIMR-LAYERS] "
+                                "END enabled=%u\n",
+                                enabled_count);
+                    }
+
+                    /*
+                     * QEMU40PDM-SOURCE-DUMP
+                     *
+                     * Passive host-side snapshot of the natural RGBA
+                     * source crop before the diagnostic XIMR conversion.
+                     *
+                     * 0x05040100 is RGBA; observed 32-bit words use
+                     * 0xAARRGGBB, therefore little-endian memory is
+                     * B,G,R,A.
+                     *
+                     * Guest memory is never modified.
+                     */
+                    {
+                        static unsigned int q40pdm_id = 0;
+
+                        uint32_t q40pdm_w = rect_w;
+                        uint32_t q40pdm_h = rect_h;
+
+                        if (src_x >= src_w ||
+                            src_y >= src_h)
+                        {
+                            q40pdm_w = 0;
+                            q40pdm_h = 0;
+                        }
+
+                        if (q40pdm_w > src_w - src_x)
+                            q40pdm_w = src_w - src_x;
+
+                        if (q40pdm_h > src_h - src_y)
+                            q40pdm_h = src_h - src_y;
+
+                        if (q40pdm_w > 960U)
+                            q40pdm_w = 960U;
+
+                        if (q40pdm_h > 600U)
+                            q40pdm_h = 600U;
+
+                        if (q40pdm_id < 4U &&
+                            q40pdm_w > 0U &&
+                            q40pdm_h > 0U)
+                        {
+                            unsigned int id = ++q40pdm_id;
+                            char rgb_name[128];
+                            char alpha_name[128];
+
+                            FILE *frgb;
+                            FILE *falpha;
+
+                            uint8_t rgba_row[960 * 4];
+                            uint8_t rgb_row[960 * 3];
+                            uint8_t alpha_row[960];
+
+                            uint32_t yy;
+                            uint32_t xx;
+
+                            snprintf(rgb_name, sizeof(rgb_name),
+                                     "/tmp/QEMU40PDM-src-%u.ppm", id);
+
+                            snprintf(alpha_name, sizeof(alpha_name),
+                                     "/tmp/QEMU40PDM-alpha-%u.pgm", id);
+
+                            frgb = fopen(rgb_name, "wb");
+                            falpha = fopen(alpha_name, "wb");
+
+                            if (frgb && falpha)
+                            {
+                                fprintf(frgb,
+                                        "P6\n%u %u\n255\n",
+                                        q40pdm_w, q40pdm_h);
+
+                                fprintf(falpha,
+                                        "P5\n%u %u\n255\n",
+                                        q40pdm_w, q40pdm_h);
+
+                                for (yy = 0; yy < q40pdm_h; yy++)
+                                {
+                                    uint64_t src_addr =
+                                        (uint64_t)src_bitmap +
+                                        (
+                                            (
+                                                (uint64_t)(src_y + yy)
+                                                * src_w
+                                                + src_x
+                                            ) * 4U
+                                        );
+
+                                    cpu_physical_memory_read(
+                                        (hwaddr)src_addr,
+                                        rgba_row,
+                                        q40pdm_w * 4U
+                                    );
+
+                                    for (xx = 0; xx < q40pdm_w; xx++)
+                                    {
+                                        /* AARRGGBB word -> B,G,R,A bytes */
+                                        rgb_row[xx * 3U + 0U] =
+                                            rgba_row[xx * 4U + 2U];
+
+                                        rgb_row[xx * 3U + 1U] =
+                                            rgba_row[xx * 4U + 1U];
+
+                                        rgb_row[xx * 3U + 2U] =
+                                            rgba_row[xx * 4U + 0U];
+
+                                        alpha_row[xx] =
+                                            rgba_row[xx * 4U + 3U];
+                                    }
+
+                                    fwrite(
+                                        rgb_row,
+                                        1,
+                                        q40pdm_w * 3U,
+                                        frgb
+                                    );
+
+                                    fwrite(
+                                        alpha_row,
+                                        1,
+                                        q40pdm_w,
+                                        falpha
+                                    );
+                                }
+
+                                fclose(frgb);
+                                fclose(falpha);
+
+                                fprintf(stderr,
+                                        "[QEMU40PDM-SOURCE-DUMP] "
+                                        "ID=%u RGB=%s ALPHA=%s "
+                                        "SRC=%08x CROP=%u,%u %ux%u\n",
+                                        id,
+                                        rgb_name,
+                                        alpha_name,
+                                        src_bitmap,
+                                        src_x,
+                                        src_y,
+                                        q40pdm_w,
+                                        q40pdm_h);
+                            }
+                            else
+                            {
+                                if (frgb)
+                                    fclose(frgb);
+
+                                if (falpha)
+                                    fclose(falpha);
+
+                                fprintf(stderr,
+                                        "[QEMU40PDM-SOURCE-DUMP] "
+                                        "ID=%u OPEN_FAILED\n",
+                                        id);
+                            }
+                        }
+                    }
+
+                    /*
+                     * Restrict this first witness to the exact
+                     * R20BH-observed 5D4 surfaces/formats.
+                     */
+                    if (l0_enable &&
+                        src_sig == 0x5652414DU &&
+                        xoc_sig == 0x5652414DU &&
+                        src_bitmap == 0x03911D00U &&
+                        /*
+                         * QEMU40PCJ:
+                         * XOC output surface address is dynamic.
+                         * Keep the proven schema strict, but accept a
+                         * complete 960x600 three-byte surface anywhere in
+                         * the modeled 5D4 uncached RAM alias.
+                         */
+                        xoc_bitmap >= 0x40004000U &&
+                        ((uint64_t)xoc_bitmap +
+                         ((uint64_t)xoc_w * xoc_h * 3U)) <=
+                            0x80000000ULL &&
+                        src_flags == 0x05040100U &&
+                        xoc_flags == 0x11060200U &&
+                        src_w == 960U &&
+                        src_h == 540U &&
+                        xoc_w == 960U &&
+                        xoc_h == 600U)
+                    {
+                        uint32_t copy_w = rect_w;
+                        uint32_t copy_h = rect_h;
+
+                        /*
+                         * QEMU40PDH-XIMR-4TO3
+                         *
+                         * Source 0x05040100 is 4 bytes/pixel.
+                         * Destination 0x11060200 is 6 bytes/2 pixels,
+                         * i.e. 3 bytes/pixel.
+                         */
+
+                        uint32_t yy;
+                        uint32_t src_first = 0;
+                        uint32_t dst_first_before = 0;
+                        uint32_t dst_first_after = 0;
+
+                        if (src_x >= src_w ||
+                            src_y >= src_h ||
+                            dst_x >= xoc_w ||
+                            dst_y >= xoc_h)
+                        {
+                            copy_w = 0;
+                            copy_h = 0;
+                        }
+
+                        if (copy_w > src_w - src_x)
+                            copy_w = src_w - src_x;
+
+                        if (copy_h > src_h - src_y)
+                            copy_h = src_h - src_y;
+
+                        if (copy_w > xoc_w - dst_x)
+                            copy_w = xoc_w - dst_x;
+
+                        if (copy_h > xoc_h - dst_y)
+                            copy_h = xoc_h - dst_y;
+
+                        if (copy_w > 960U)
+                            copy_w = 960U;
+
+                        if (copy_w && copy_h)
+                        {
+                            uint8_t src_row[960 * 4];
+                            uint8_t dst_row[960 * 3];
+
+                            uint32_t xx;
+
+                            uint64_t src_first_addr =
+                                (uint64_t)src_bitmap +
+                                (
+                                    (
+                                        (uint64_t)src_y * src_w
+                                        + src_x
+                                    ) * 4U
+                                );
+
+                            uint64_t dst_first_addr =
+                                (uint64_t)xoc_bitmap +
+                                (
+                                    (
+                                        (uint64_t)dst_y * xoc_w
+                                        + dst_x
+                                    ) * 3U
+                                );
+
+                            cpu_physical_memory_read(
+                                (hwaddr)src_first_addr,
+                                &src_first,
+                                sizeof(src_first)
+                            );
+
+                            cpu_physical_memory_read(
+                                (hwaddr)dst_first_addr,
+                                &dst_first_before,
+                                sizeof(dst_first_before)
+                            );
+
+                            for (yy = 0; yy < copy_h; yy++)
+                            {
+                                uint64_t src_addr =
+                                    (uint64_t)src_bitmap +
+                                    (
+                                        (
+                                            (uint64_t)(src_y + yy)
+                                            * src_w
+                                            + src_x
+                                        ) * 4U
+                                    );
+
+                                uint64_t dst_addr =
+                                    (uint64_t)xoc_bitmap +
+                                    (
+                                        (
+                                            (uint64_t)(dst_y + yy)
+                                            * xoc_w
+                                            + dst_x
+                                        ) * 3U
+                                    );
+
+                                cpu_physical_memory_read(
+                                    (hwaddr)src_addr,
+                                    src_row,
+                                    copy_w * 4U
+                                );
+
+                                /*
+                                 * Observed source words are AARRGGBB as
+                                 * little-endian bytes B,G,R,A.
+                                 *
+                                 * Preserve the three colour bytes and
+                                 * discard the fourth byte. This is only
+                                 * the observed-format witness; it is not
+                                 * claimed as complete XIMR emulation.
+                                 */
+                                for (xx = 0; xx < copy_w; xx++)
+                                {
+                                    dst_row[xx * 3U + 0U] =
+                                        src_row[xx * 4U + 0U];
+
+                                    dst_row[xx * 3U + 1U] =
+                                        src_row[xx * 4U + 1U];
+
+                                    dst_row[xx * 3U + 2U] =
+                                        src_row[xx * 4U + 2U];
+                                }
+
+                                cpu_physical_memory_write(
+                                    (hwaddr)dst_addr,
+                                    dst_row,
+                                    copy_w * 3U
+                                );
+                            }
+
+                            cpu_physical_memory_read(
+                                (hwaddr)dst_first_addr,
+                                &dst_first_after,
+                                sizeof(dst_first_after)
+                            );
+
+                            bi_ximr_jobs++;
+                            bi_pixels +=
+                                (uint64_t)copy_w * copy_h;
+
+                            fprintf(
+                                stderr,
+                                "[QEMU40PAD-BC-R20BI-XIMR24-WITNESS] "
+                                "#%llu COPY3 "
+                                "src=%u,%u "
+                                "dst=%u,%u "
+                                "size=%ux%u "
+                                "src_first=%08x "
+                                "dst_before=%08x "
+                                "dst_after=%08x "
+                                "total_pixels=%llu\n",
+                                (unsigned long long)bi_ximr_jobs,
+                                src_x,
+                                src_y,
+                                dst_x,
+                                dst_y,
+                                copy_w,
+                                copy_h,
+                                src_first,
+                                dst_first_before,
+                                dst_first_after,
+                                (unsigned long long)bi_pixels
+                            );
+                        }
+                        else
+                        {
+                            fprintf(
+                                stderr,
+                                "[QEMU40PAD-BC-R20BI-XIMR24-WITNESS] "
+                                "EMPTY_OR_INVALID_RECT\n"
+                            );
+                        }
+                    }
+                    else
+                    {
+                        fprintf(
+                            stderr,
+                            "[QEMU40PAD-BC-R20BI-XIMR24-WITNESS] "
+                            "SCHEMA_REJECTED\n"
+                        );
+                    }
+                }
+
+                q40pad_bb_mzrm_target_idx = write_idx;
+                q40pad_bb_mzrm_consume_armed = 1;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-BB-MZRM] "
+                        "D20F0840=%08x "
+                        "write_idx=%08x read_idx=%08x result=%08x "
+                        "-> deferred target=%08x\n",
+                        value,
+                        write_idx,
+                        read_idx,
+                        result,
+                        q40pad_bb_mzrm_target_idx);
+
+                /*
+                 * Make slot 2 pending and schedule the same Canon IRQ
+                 * path proven by PAD-AU.
+                 *
+                 * Consumer advancement is deliberately NOT performed
+                 * here.
+                 */
+                q40pad_au_zico_irq19a_pending |= 0x00000004U;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-BB-MZRM] "
+                        "completion armed pending=%08x -> IRQ 0x19A\n",
+                        q40pad_au_zico_irq19a_pending);
+
+                eos_trigger_int(0x19A, 1);
+
+                msg = "5D4 deferred MZRM Zico completion";
+            }
+            break;
+
+        case 0xD20F0818:
+            if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+            {
+                if (type & MODE_READ)
+                {
+                    /*
+             * QEMU40PAD-BB-MZRM:
+             *
+             * The IRQ has now reached Canon's IRQ19A service path.
+             * Model Zico having consumed all producer entries before
+             * Canon dispatches the registered completion callback.
+             */
+            if (q40pad_bb_mzrm_consume_armed &&
+                (q40pad_au_zico_irq19a_pending & 0x00000004U))
+            {
+                uint32_t read_idx_before = 0;
+
+                cpu_physical_memory_read(
+                    0xBFF00428,
+                    &read_idx_before,
+                    sizeof(read_idx_before)
+                );
+
+                cpu_physical_memory_write(
+                    0xBFF00428,
+                    &q40pad_bb_mzrm_target_idx,
+                    sizeof(q40pad_bb_mzrm_target_idx)
+                );
+
+                fprintf(stderr,
+                        "[QEMU40PAD-BB-MZRM] "
+                        "IRQ service consumer advance "
+                        "BFF00428: %08x -> %08x\n",
+                        read_idx_before,
+                        q40pad_bb_mzrm_target_idx);
+
+                q40pad_bb_mzrm_consume_armed = 0;
+            }
+
+            ret = q40pad_au_zico_irq19a_pending;
+                    msg = "5D4 Zico IRQ19A pending";
+
+                    fprintf(stderr,
+                            "[QEMU40PAD-AU-ZICO] "
+                            "D20F0818 READ -> %08x\n",
+                            ret);
+                }
+            }
+            break;
+
+        /*
+         * Zico IRQ 0x19A acknowledge.
+         *
+         * FE213AB2 writes the pending mask it just consumed to
+         * D20F0814 before dispatching callbacks.
+         * Treat set bits as W1C acknowledgement.
+         */
+        case 0xD20F0814:
+            if (!strcmp(eos_state->model->name, MODEL_NAME_5D4) &&
+                (type & MODE_WRITE))
+            {
+                fprintf(stderr,
+                        "[QEMU40PAD-AU-ZICO] "
+                        "D20F0814 ACK=%08x pending_before=%08x\n",
+                        value,
+                        q40pad_au_zico_irq19a_pending);
+
+                q40pad_au_zico_irq19a_pending &= ~value;
+
+                fprintf(stderr,
+                        "[QEMU40PAD-AU-ZICO] "
+                        "pending_after=%08x\n",
+                        q40pad_au_zico_irq19a_pending);
+
+                msg = "5D4 Zico IRQ19A acknowledge";
+            }
             break;
 
         case 0xD2030000:    /* M3: memif_wait_us */
@@ -6908,6 +11981,7 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
             msg = "PhySw Internal Flash + ";    /* M3: Flash + */
             ret = 0x00000840;
             break;
+
 
         case 0xD20B0400:                /* 80D: 0x10000 = no card present */
         case 0xD20B22A8:                /* 5D4: same */
@@ -7046,6 +12120,163 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
     if (address >= 0xD0130000 && address <= 0xD0130FFF) {
         msg = "RP GPIO";
         ret = 0;
+    }
+
+    /*
+     * QEMU40HE-RTC-READY
+     * Diagnostic only: allow the 5D4 RTC path to pass FE1FC0F8
+     * so QEMU40HD can observe the downstream D984 transaction.
+     */
+    if (!(type & MODE_WRITE) &&
+        address == 0xD20B2318U &&
+        !strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        ret = 0x00010000U;
+    }
+
+
+    /*
+     * QEMU40HI-D984-COMPLETION
+     *
+     * Canon 5D4 RTC uses controller #2:
+     *   launch/status bank D9840Axx
+     * ISR FE4C7B40:
+     *   reads D9840A08,
+     *   tests status & 0xF000,
+     *   GiveSemaphore when bit 0x1000 is set.
+     *
+     * Diagnostic model:
+     *   D9840A04 write -> completion bit 0x1000 + IRQ 0xB8.
+     *   Canon ISR performs the normal ACK by writing D9840A08.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        if (address == 0xD9840A08U)
+        {
+            if (type & MODE_WRITE)
+            {
+                uint32_t old_status = q40hi_d9840a08;
+                q40hi_d9840a08 = value;
+
+                if ((old_status & 0x00001000U) &&
+                    !(value & 0x00001000U))
+                {
+                    fprintf(stderr,
+                            "[QEMU40HI-RTC] ACK D9840A08 old=%08X new=%08X\n",
+                            old_status, value);
+                }
+            }
+            else
+            {
+                ret = q40hi_d9840a08;
+
+                if ((ret & 0x00001000U) &&
+                    !q40hi_status_read_logged)
+                {
+                    fprintf(stderr,
+                            "[QEMU40HI-RTC] ISR status read D9840A08 -> %08X\n",
+                            ret);
+                    q40hi_status_read_logged = 1;
+                }
+            }
+        }
+
+        if ((type & MODE_WRITE) &&
+            address == 0xD9840A04U)
+        {
+            q40hi_d9840a08 |= 0x00001000U;
+            q40hi_status_read_logged = 0;
+            q40hi_irq_count++;
+
+            fprintf(stderr,
+                    "[QEMU40HI-RTC] launch #%u D9840A04=%08X status=%08X -> IRQ 0xB8\n",
+                    q40hi_irq_count, value, q40hi_d9840a08);
+
+            eos_trigger_int(0xB8, 1);
+        }
+    }
+    /*
+     * QEMU40HN-RTC-FRAME
+     *
+     * 0x801181C2 is the observed controller setup for the
+     * 18-byte FE1FBE4A RTC read. 0x21700000 launches its RX phase.
+     *
+     * Do not answer unrelated RTC transactions with this frame.
+     */
+    if (!strcmp(eos_state->model->name, MODEL_NAME_5D4))
+    {
+        static const unsigned char q40hn_rtc_bus[20] = {
+            /* C0..C3 -> logical bytes 3,2,1,0 */
+            0x02, 0x12, 0x34, 0x20,
+
+            /* C4..C7 -> logical bytes 7,6,5,4 */
+            0x00, 0x24, 0x01, 0x01,
+
+            /* C8..CB -> logical bytes 11..8 */
+            0x00, 0x00, 0x00, 0x00,
+
+            /* CC..CF -> logical bytes 15..12 */
+            0x00, 0x00, 0x00, 0x00,
+
+            /* D0,D1 unused by the 18-byte transfer;
+               D2,D3 -> logical bytes 17,16 */
+            0x00, 0x00, 0x00, 0x20
+        };
+
+        if ((type & MODE_WRITE) && address == 0xD9840A00U)
+        {
+            q40hn_rtc_cfg = value;
+        }
+
+        if ((type & MODE_WRITE) && address == 0xD9840A04U)
+        {
+        }
+
+        if ((type & MODE_WRITE) &&
+            address == 0xD9840A04U &&
+            value == 0x21700000U &&
+            q40hn_rtc_cfg == 0x801181C2U)
+        {
+            q40hn_rtc_frame_active = 1;
+            q40hn_rtc_frame_reads = 0;
+
+            fprintf(stderr,
+                "[QEMU40HN-RTC] arm 18-byte BCD frame\n");
+        }
+
+        if (!(type & MODE_WRITE) &&
+            q40hn_rtc_frame_active &&
+            address >= 0xD98401C0U &&
+            address <= 0xD98401D3U)
+        {
+            ret = q40hn_rtc_bus[address - 0xD98401C0U];
+
+            fprintf(stderr,
+                "[QEMU40HN-RTC] data[%u] addr=%08X -> %02X\n",
+                q40hn_rtc_frame_reads,
+                address,
+                ret & 0xFF);
+
+            q40hn_rtc_frame_reads++;
+
+            if (q40hn_rtc_frame_reads >= 18)
+            {
+                q40hn_rtc_frame_active = 0;
+                fprintf(stderr,
+                    "[QEMU40HN-RTC] frame complete\n");
+            }
+        }
+    }
+
+    if (q40hd_rtc_mmio)
+    {
+        fprintf(stderr,
+                "[QEMU40HD-RTCMMIO] %c addr=%08X value=%08X ret=%08X type=%02X\\n",
+                (type & MODE_WRITE) ? 'W' : 'R',
+                address,
+                value,
+                ret,
+                type);
     }
 
     io_log("DIGIC6", address, type, value, ret, msg, 0, 0);

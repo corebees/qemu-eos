@@ -857,9 +857,132 @@ void HELPER(log_ldr)(uint32_t addr, uint32_t value, uint32_t opc)
     log_ldr_cb(addr, value, opc);
 }
 
-void HELPER(log_str)(uint32_t addr, uint32_t value, uint32_t opc)
+void HELPER(log_str)(CPUARMState *env, uint32_t addr,
+                     uint32_t value, uint32_t opc, uint32_t pc)
 {
+    unsigned size = 1u << (opc & 3);
+    uint64_t end = (uint64_t)addr + size;
+
+    /* Log only writes touching fRefreshDisplay @ 0xFE0C. */
+    if ((uint64_t)addr > 0x0000FE0CULL ||
+        end <= 0x0000FE0CULL) {
+        return;
+    }
+
+    fprintf(stderr,
+        "[QEMU40PCK-FREFRESH] CPU=%d PC=%08X LR=%08X "
+        "ADDR=%08X SIZE=%u VALUE=%08X\n",
+        current_cpu ? current_cpu->cpu_index : -1,
+        pc, env->regs[14], addr, size, value);
+
     log_str_cb(addr, value, opc);
+}
+
+
+void HELPER(log_pcp)(CPUARMState *env, uint32_t pc)
+{
+
+    /*
+     * QEMU40PDK-PDISP:
+     * passive dump of the eight words validated at FE4684B0.
+     * No guest-memory modification.
+     */
+    if (pc == 0xFE4684B0U)
+    {
+        uint32_t pdisp = env->regs[0];
+        uint32_t w[8] = {0};
+
+        if (pdisp >= 0x1000U)
+        {
+            cpu_physical_memory_read(
+                pdisp,
+                w,
+                sizeof(w)
+            );
+        }
+
+        fprintf(stderr,
+                "[QEMU40PDK-PDISP] "
+                "PTR=%08X "
+                "W00=%08X W04=%08X "
+                "W08=%08X W0C=%08X "
+                "W10=%08X W14=%08X "
+                "W18=%08X W1C=%08X\n",
+                pdisp,
+                w[0], w[1],
+                w[2], w[3],
+                w[4], w[5],
+                w[6], w[7]);
+    }
+
+    /*
+     * QEMU40PDG-MEM:
+     * passive snapshot of the surface descriptor passed in R0.
+     * Only at pre-call PCs where R0 is known to be the descriptor.
+     */
+    if (pc == 0xFE1CC804U ||
+        pc == 0xFE1CC80CU ||
+        pc == 0xFE1CC916U ||
+        pc == 0xFE1CC920U)
+    {
+        uint32_t surf = env->regs[0];
+        uint32_t f4 = 0;
+        uint32_t f8 = 0;
+        uint32_t f12 = 0;
+        uint32_t f16 = 0;
+        uint32_t f20 = 0;
+
+        if (surf >= 0x1000U)
+        {
+            cpu_physical_memory_read(surf + 4U,  &f4,  4);
+            cpu_physical_memory_read(surf + 8U,  &f8,  4);
+            cpu_physical_memory_read(surf + 12U, &f12, 4);
+            cpu_physical_memory_read(surf + 16U, &f16, 4);
+            cpu_physical_memory_read(surf + 20U, &f20, 4);
+        }
+
+        fprintf(stderr,
+                "[QEMU40PDG-MEM] "
+                "PC=%08X SURF=%08X "
+                "F4=%08X F8=%08X "
+                "FMT=%08X WIDTH=%08X F20=%08X "
+                "R1=%08X R2=%08X R3=%08X\n",
+                pc,
+                surf,
+                f4,
+                f8,
+                f12,
+                f16,
+                f20,
+                env->regs[1],
+                env->regs[2],
+                env->regs[3]);
+    }
+
+    fprintf(stderr,
+        "[QEMU40PDG-SURF] CPU=%d PC=%08X LR=%08X "
+        "R0=%08X R1=%08X R2=%08X R3=%08X "
+        "R4=%08X R5=%08X R6=%08X\n",
+        current_cpu ? current_cpu->cpu_index : -1,
+        pc,
+        env->regs[14],
+        env->regs[0], env->regs[1],
+        env->regs[2], env->regs[3],
+        env->regs[4], env->regs[5],
+        env->regs[6]);
+}
+
+void HELPER(log_str64)(CPUARMState *env, uint32_t addr,
+                       uint64_t value, uint32_t opc, uint32_t pc)
+{
+    unsigned size = 1u << (opc & 3);
+
+    fprintf(stderr,
+        "[QEMU40PBX-FREFRESH64] CPU=%d PC=%08X LR=%08X "
+        "ADDR=%08X SIZE=%u VALUE=%016llX\n",
+        current_cpu ? current_cpu->cpu_index : -1,
+        pc, env->regs[14], addr, size,
+        (unsigned long long)value);
 }
 
 uint32_t HELPER(get_cp_reg)(CPUARMState *env, void *rip)

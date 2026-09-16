@@ -303,6 +303,8 @@ const QEMULogItem qemu_log_items[] = {
       "EOS: log all ROM reads" },
     { EOS_PR(EOS_LOG_RAM_W) | EOS_LOG_RAM_W, "ramw",
       "EOS: log all RAM writes" },
+    { EOS_LOG_RAM_W, "ramw_backend",
+      "EOS: enable RAM write backend without verbose RAM output" },
     { EOS_PR(EOS_LOG_ROM_W) | EOS_LOG_ROM_W, "romw",
       "EOS: log all ROM writes" },
     { EOS_LOG_RAM_DBG | EOS_LOG_RAM, "ram_dbg",
